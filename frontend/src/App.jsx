@@ -52,7 +52,7 @@ const SHIFT_META = {
   OFF: { label: "休", name: "休假", time: "不排班" },
 };
 const WORK_SHIFT_CODES = new Set(["A", "B"]);
-const THEME_COLORS = { light: "#f2f3ef", dark: "#171a18" };
+const THEME_COLORS = { light: "#f4f1e8", dark: "#181713" };
 const STAFF_COLORS = ["#ef6a5b", "#4c7ee8", "#2f9b77", "#d69232", "#8b68c9", "#c85682"];
 
 function api(path, options = {}) {

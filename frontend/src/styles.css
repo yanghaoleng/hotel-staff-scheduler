@@ -6,19 +6,19 @@
 
 :root {
   color-scheme: light;
-  --bg: #f2f3ef;
-  --surface: #fbfbf8;
-  --surface-strong: #ffffff;
-  --surface-soft: #eceee9;
-  --text: #1f2421;
-  --text-soft: #676d68;
-  --text-faint: #939994;
-  --line: #dddfda;
-  --line-strong: #cdd0ca;
-  --accent: #dd5d4f;
-  --accent-hover: #c95044;
-  --accent-soft: rgba(221, 93, 79, 0.12);
-  --accent-text: #ffffff;
+  --bg: #f4f1e8;
+  --surface: #fbf9f2;
+  --surface-strong: #fffdf8;
+  --surface-soft: #eee9dc;
+  --text: #29261f;
+  --text-soft: #6d675b;
+  --text-faint: #989082;
+  --line: #e2dccf;
+  --line-strong: #cec5b5;
+  --accent: #d6b86d;
+  --accent-hover: #c7a657;
+  --accent-soft: rgba(214, 184, 109, 0.18);
+  --accent-text: #342b17;
   --shadow: 0 18px 60px rgba(41, 48, 43, 0.08);
   --shadow-small: 0 8px 24px rgba(41, 48, 43, 0.07);
   --header-height: 0px;
@@ -32,19 +32,19 @@
 
 :root[data-theme="dark"] {
   color-scheme: dark;
-  --bg: #171a18;
-  --surface: #1d211e;
-  --surface-strong: #242824;
-  --surface-soft: #292d29;
-  --text: #f0f1ed;
-  --text-soft: #aeb4ae;
-  --text-faint: #777e78;
-  --line: #343934;
-  --line-strong: #464c46;
-  --accent: #ef7466;
-  --accent-hover: #f18376;
-  --accent-soft: rgba(239, 116, 102, 0.14);
-  --accent-text: #1e1514;
+  --bg: #181713;
+  --surface: #201e19;
+  --surface-strong: #27241d;
+  --surface-soft: #302c25;
+  --text: #f2eee3;
+  --text-soft: #b5ad9e;
+  --text-faint: #7e776c;
+  --line: #3b372f;
+  --line-strong: #514b3f;
+  --accent: #e5ca82;
+  --accent-hover: #edd693;
+  --accent-soft: rgba(229, 202, 130, 0.16);
+  --accent-text: #2a230f;
   --shadow: 0 20px 70px rgba(0, 0, 0, 0.24);
   --shadow-small: 0 10px 28px rgba(0, 0, 0, 0.19);
 }
@@ -67,7 +67,7 @@ button, select { cursor: pointer; }
 button:disabled, input:disabled, textarea:disabled { cursor: not-allowed; opacity: .58; }
 
 button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible {
-  outline: 3px solid rgba(221, 93, 79, .2);
+  outline: 3px solid var(--accent-soft);
   outline-offset: 2px;
 }
 
