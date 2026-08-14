@@ -1,6 +1,6 @@
 # 栖班：酒店人员排班工具
 
-为 Jennie 制作的酒店人员排班网页。每位员工使用固定颜色，支持月历查看、拖放改期、手动增删班次和 DeepSeek V4 Flash 自然语言排班。
+为 Jennie 制作的公共协作酒店排班网页。每位员工使用固定颜色，支持多 Sheet、月历查看、拖放改期、手动增删班次和 DeepSeek V4 Flash 自然语言排班。
 
 ## 已实现
 
@@ -11,7 +11,9 @@
 - DeepSeek V4 Flash 生成未来排班
 - AI 批量修改一键撤销
 - 明亮、暗色主题
-- 共享访问口令
+- 无账号、无登录，打开网页即可共同编辑
+- 多张独立排班 Sheet，所有人都可以创建、改名和删除
+- 页面每 12 秒自动同步其他人的修改
 - SQLite 持久化数据
 - Jennie 2026 年 8 月 10-16 日截图排班已导入
 
@@ -25,12 +27,11 @@ npm run build
 cd ..
 python3 -m venv .venv
 .venv/bin/pip install -r backend/requirements.txt
-PLAN_ACCESS_CODE=dev-plan \
 PLAN_DATABASE_PATH=/tmp/hotel-scheduler.db \
 .venv/bin/gunicorn backend.app:app --bind 127.0.0.1:8094
 ```
 
-打开 `http://127.0.0.1:8094`，输入本地访问口令。
+打开 `http://127.0.0.1:8094` 即可编辑。
 
 ## 服务器环境变量
 
@@ -38,7 +39,6 @@ PLAN_DATABASE_PATH=/tmp/hotel-scheduler.db \
 
 ```dotenv
 DEEPSEEK_API_KEY=replace_me
-PLAN_ACCESS_CODE=replace_me
 PLAN_DATABASE_PATH=/opt/hotel-scheduler/shared/plan.db
 PLAN_PORT=8094
 ```
@@ -51,4 +51,3 @@ PLAN_PORT=8094
 - Nginx 域名：`plan.mikeywa.site`
 - 服务器已安装每日发布版本修剪任务，首页与 Massage OS 均只保留最近 3 个版本。
 - 发布包应来自干净工作区或 `git archive`，禁止把 `previous`、`rollback`、`releases`、数据库和环境变量打进新版本。
-

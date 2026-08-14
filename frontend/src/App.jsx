@@ -26,7 +26,6 @@ import { zhCN } from "date-fns/locale";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import {
   ArrowCounterClockwise,
-  ArrowRight,
   CalendarBlank,
   CaretLeft,
   CaretRight,
@@ -36,6 +35,7 @@ import {
   GearSix,
   Lightning,
   Moon,
+  PencilSimple,
   Plus,
   Sparkle,
   Sun,
@@ -53,12 +53,11 @@ const SHIFT_META = {
 };
 const STAFF_COLORS = ["#ef6a5b", "#4c7ee8", "#2f9b77", "#d69232", "#8b68c9", "#c85682"];
 
-function api(path, accessCode, options = {}) {
+function api(path, options = {}) {
   return fetch(path, {
     ...options,
     headers: {
       "Content-Type": "application/json",
-      "X-Plan-Access": accessCode,
       ...(options.headers || {}),
     },
   }).then(async (response) => {
@@ -80,71 +79,6 @@ function rgba(hex, alpha) {
   const g = (parsed >> 8) & 255;
   const b = parsed & 255;
   return `rgba(${r}, ${g}, ${b}, ${alpha})`;
-}
-
-function Login({ onSuccess }) {
-  const [code, setCode] = useState("");
-  const [error, setError] = useState("");
-  const [loading, setLoading] = useState(false);
-  const reduceMotion = useReducedMotion();
-
-  async function submit(event) {
-    event.preventDefault();
-    setLoading(true);
-    setError("");
-    try {
-      const response = await fetch("/api/session", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ code }),
-      });
-      const body = await response.json();
-      if (!response.ok) throw new Error(body.error || "访问口令不正确");
-      localStorage.setItem("plan-access", code);
-      onSuccess(code);
-    } catch (submitError) {
-      setError(submitError.message);
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  return (
-    <main className="login-page">
-      <motion.section
-        className="login-card"
-        initial={reduceMotion ? false : { opacity: 0, y: 18, scale: 0.985 }}
-        animate={{ opacity: 1, y: 0, scale: 1 }}
-        transition={{ duration: 0.55, ease: [0.16, 1, 0.3, 1] }}
-      >
-        <div className="login-mark"><CalendarBlank size={27} weight="fill" /></div>
-        <p className="login-kicker">酒店人员排班</p>
-        <h1>今天怎么排，一眼就清楚。</h1>
-        <p className="login-copy">输入共享口令，进入 Jennie 的排班日历。</p>
-        <form onSubmit={submit} className="login-form">
-          <label htmlFor="access-code">访问口令</label>
-          <div className={`login-input-wrap ${error ? "has-error" : ""}`}>
-            <input
-              id="access-code"
-              type="password"
-              value={code}
-              onChange={(event) => setCode(event.target.value)}
-              placeholder="请输入口令"
-              autoComplete="current-password"
-              autoFocus
-            />
-            <button type="submit" disabled={!code || loading} aria-label="进入排班">
-              {loading ? <span className="button-loader" /> : <ArrowRight size={19} />}
-            </button>
-          </div>
-          {error && <p className="form-error">{error}</p>}
-        </form>
-        <p className="login-note">排班数据受到口令保护，仅保存在腾讯云服务器。</p>
-      </motion.section>
-      <div className="login-orb login-orb-one" />
-      <div className="login-orb login-orb-two" />
-    </main>
-  );
 }
 
 function ShiftCard({ shift, onEdit, ghost = false }) {
@@ -349,6 +283,68 @@ function StaffEditor({ staff, onAdd, onUpdate, onClose, busy }) {
   );
 }
 
+function SheetEditor({ schedule, onSave, onDelete, onClose, busy, canDelete }) {
+  const [name, setName] = useState(schedule?.name || "");
+  const isEditing = Boolean(schedule?.id);
+  return (
+    <Modal
+      title={isEditing ? "设置排班表" : "新建排班表"}
+      subtitle={isEditing ? "改名或删除当前 Sheet" : "创建一张独立的新 Sheet"}
+      onClose={onClose}
+    >
+      <form
+        className="editor-form"
+        onSubmit={(event) => {
+          event.preventDefault();
+          if (name.trim()) onSave({ ...schedule, name: name.trim() });
+        }}
+      >
+        <div className="field-group">
+          <label htmlFor="sheet-name">Sheet 名称</label>
+          <input
+            id="sheet-name"
+            value={name}
+            maxLength={32}
+            onChange={(event) => setName(event.target.value)}
+            placeholder="例如：9月正式排班"
+            autoFocus
+          />
+        </div>
+        <p className="sheet-editor-note">每张 Sheet 的班次互相独立，参与人员名单会共享。</p>
+        <footer className="modal-actions">
+          {isEditing && canDelete ? (
+            <button className="danger-button" type="button" onClick={() => onDelete(schedule)} disabled={busy}>
+              <Trash size={17} /> 删除 Sheet
+            </button>
+          ) : <span />}
+          <div>
+            <button className="secondary-button" type="button" onClick={onClose}>取消</button>
+            <button className="primary-button" type="submit" disabled={busy || !name.trim()}>
+              {busy ? <span className="button-loader dark" /> : <Check size={17} weight="bold" />} 保存
+            </button>
+          </div>
+        </footer>
+      </form>
+    </Modal>
+  );
+}
+
+function DeleteSheetConfirm({ schedule, onConfirm, onClose, busy }) {
+  return (
+    <Modal title="删除这张排班表？" subtitle="这一步会删除 Sheet 内的全部班次" onClose={onClose}>
+      <div className="confirm-sheet-delete">
+        <p><strong>{schedule.name}</strong> 删除后无法恢复，其他 Sheet 不会受到影响。</p>
+        <div>
+          <button className="secondary-button" type="button" onClick={onClose}>取消</button>
+          <button className="danger-button solid" type="button" onClick={onConfirm} disabled={busy}>
+            {busy ? <span className="button-loader" /> : <Trash size={17} />} 确认删除
+          </button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
 function Toasts({ toasts, dismiss }) {
   return (
     <div className="toast-region" aria-live="polite">
@@ -372,8 +368,10 @@ function Toasts({ toasts, dismiss }) {
   );
 }
 
-function Scheduler({ accessCode, onUnauthorized }) {
+function Scheduler() {
   const [month, setMonth] = useState(() => startOfMonth(new Date()));
+  const [schedules, setSchedules] = useState([]);
+  const [activeScheduleId, setActiveScheduleId] = useState(() => Number(localStorage.getItem("plan-sheet")) || null);
   const [staff, setStaff] = useState([]);
   const [shifts, setShifts] = useState([]);
   const [aiInfo, setAiInfo] = useState({ configured: false, model: "deepseek-v4-flash" });
@@ -382,6 +380,8 @@ function Scheduler({ accessCode, onUnauthorized }) {
   const [activeShift, setActiveShift] = useState(null);
   const [editor, setEditor] = useState(null);
   const [staffEditorOpen, setStaffEditorOpen] = useState(false);
+  const [sheetEditor, setSheetEditor] = useState(null);
+  const [sheetDeleteCandidate, setSheetDeleteCandidate] = useState(null);
   const [aiPrompt, setAiPrompt] = useState("");
   const [aiBusy, setAiBusy] = useState(false);
   const [activeBatch, setActiveBatch] = useState(null);
@@ -418,22 +418,30 @@ function Scheduler({ accessCode, onUnauthorized }) {
     localStorage.setItem("plan-theme", theme);
   }, [theme]);
 
-  async function loadData({ quiet = false } = {}) {
+  async function loadData({ quiet = false, scheduleId = activeScheduleId } = {}) {
     if (!quiet) setLoading(true);
     try {
-      const data = await api(`/api/bootstrap?start=${startIso}&end=${endIso}`, accessCode);
+      const scheduleQuery = scheduleId ? `&scheduleId=${scheduleId}` : "";
+      const data = await api(`/api/bootstrap?start=${startIso}&end=${endIso}${scheduleQuery}`);
+      setSchedules(data.schedules);
+      setActiveScheduleId(data.activeSchedule.id);
+      localStorage.setItem("plan-sheet", String(data.activeSchedule.id));
       setStaff(data.staff);
       setShifts(data.shifts);
       setAiInfo(data.ai);
     } catch (error) {
-      if (error.status === 401) onUnauthorized();
-      else toast(error.message, "error");
+      toast(error.message, "error");
     } finally {
       setLoading(false);
     }
   }
 
-  useEffect(() => { loadData(); }, [startIso, endIso]);
+  useEffect(() => { loadData(); }, [startIso, endIso, activeScheduleId]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => loadData({ quiet: true }), 12000);
+    return () => window.clearInterval(timer);
+  }, [startIso, endIso, activeScheduleId]);
 
   const shiftsByDay = useMemo(() => {
     const grouped = new Map();
@@ -460,13 +468,18 @@ function Scheduler({ accessCode, onUnauthorized }) {
     setBusy(true);
     try {
       const editing = Boolean(value.id);
-      const result = await api(editing ? `/api/shifts/${value.id}` : "/api/shifts", accessCode, {
+      const result = await api(editing ? `/api/shifts/${value.id}` : "/api/shifts", {
         method: editing ? "PATCH" : "POST",
-        body: JSON.stringify(value),
+        body: JSON.stringify({ ...value, scheduleId: activeScheduleId }),
       });
       setShifts((current) => editing
         ? current.map((item) => item.id === value.id ? result.shift : item)
         : [...current, result.shift]);
+      if (!editing) {
+        setSchedules((current) => current.map((item) => item.id === activeScheduleId
+          ? { ...item, shiftCount: item.shiftCount + 1 }
+          : item));
+      }
       setEditor(null);
       toast(editing ? "班次已更新" : "班次已添加");
     } catch (error) {
@@ -479,8 +492,11 @@ function Scheduler({ accessCode, onUnauthorized }) {
   async function deleteShift(value) {
     setBusy(true);
     try {
-      await api(`/api/shifts/${value.id}`, accessCode, { method: "DELETE" });
+      await api(`/api/shifts/${value.id}`, { method: "DELETE" });
       setShifts((current) => current.filter((item) => item.id !== value.id));
+      setSchedules((current) => current.map((item) => item.id === activeScheduleId
+        ? { ...item, shiftCount: Math.max(0, item.shiftCount - 1) }
+        : item));
       setEditor(null);
       toast("班次已删除");
     } catch (error) {
@@ -495,7 +511,7 @@ function Scheduler({ accessCode, onUnauthorized }) {
     const original = shift.date;
     setShifts((current) => current.map((item) => item.id === shift.id ? { ...item, date: dateValue } : item));
     try {
-      const result = await api(`/api/shifts/${shift.id}`, accessCode, {
+      const result = await api(`/api/shifts/${shift.id}`, {
         method: "PATCH",
         body: JSON.stringify({ date: dateValue }),
       });
@@ -511,9 +527,9 @@ function Scheduler({ accessCode, onUnauthorized }) {
     if (!aiPrompt.trim()) return;
     setAiBusy(true);
     try {
-      const result = await api("/api/ai/generate", accessCode, {
+      const result = await api("/api/ai/generate", {
         method: "POST",
-        body: JSON.stringify({ prompt: aiPrompt.trim(), start: format(startOfMonth(month), "yyyy-MM-dd"), end: format(endOfMonth(month), "yyyy-MM-dd") }),
+        body: JSON.stringify({ scheduleId: activeScheduleId, prompt: aiPrompt.trim(), start: format(startOfMonth(month), "yyyy-MM-dd"), end: format(endOfMonth(month), "yyyy-MM-dd") }),
       });
       setActiveBatch(result.batchId);
       setAiPrompt("");
@@ -532,7 +548,7 @@ function Scheduler({ accessCode, onUnauthorized }) {
   async function undoAi(batchId = activeBatch) {
     if (!batchId) return;
     try {
-      await api(`/api/ai/undo/${batchId}`, accessCode, { method: "POST" });
+      await api(`/api/ai/undo/${batchId}`, { method: "POST" });
       setActiveBatch(null);
       await loadData({ quiet: true });
       toast("已经恢复到生成前的排班");
@@ -544,7 +560,7 @@ function Scheduler({ accessCode, onUnauthorized }) {
   async function addStaff(value) {
     setBusy(true);
     try {
-      const result = await api("/api/staff", accessCode, { method: "POST", body: JSON.stringify(value) });
+      const result = await api("/api/staff", { method: "POST", body: JSON.stringify(value) });
       setStaff((current) => [...current, result.staff]);
       toast(`${value.name} 已加入排班`);
     } catch (error) {
@@ -557,7 +573,7 @@ function Scheduler({ accessCode, onUnauthorized }) {
 
   async function updateStaff(id, values) {
     try {
-      const result = await api(`/api/staff/${id}`, accessCode, { method: "PATCH", body: JSON.stringify(values) });
+      const result = await api(`/api/staff/${id}`, { method: "PATCH", body: JSON.stringify(values) });
       if (result.staff.active) setStaff((current) => current.map((item) => item.id === id ? result.staff : item));
       else setStaff((current) => current.filter((item) => item.id !== id));
       await loadData({ quiet: true });
@@ -566,10 +582,63 @@ function Scheduler({ accessCode, onUnauthorized }) {
     }
   }
 
+  async function saveSchedule(value) {
+    setBusy(true);
+    try {
+      const editing = Boolean(value.id);
+      const result = await api(editing ? `/api/schedules/${value.id}` : "/api/schedules", {
+        method: editing ? "PATCH" : "POST",
+        body: JSON.stringify({ name: value.name }),
+      });
+      setSchedules((current) => editing
+        ? current.map((item) => item.id === value.id ? result.schedule : item)
+        : [...current, result.schedule]);
+      setSheetEditor(null);
+      if (!editing) {
+        setActiveBatch(null);
+        setActiveScheduleId(result.schedule.id);
+        localStorage.setItem("plan-sheet", String(result.schedule.id));
+      }
+      toast(editing ? "Sheet 已改名" : `已创建「${result.schedule.name}」`);
+    } catch (error) {
+      toast(error.message, "error");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function deleteSchedule() {
+    if (!sheetDeleteCandidate) return;
+    setBusy(true);
+    try {
+      const result = await api(`/api/schedules/${sheetDeleteCandidate.id}`, { method: "DELETE" });
+      setSchedules((current) => current.filter((item) => item.id !== sheetDeleteCandidate.id));
+      setSheetDeleteCandidate(null);
+      setActiveBatch(null);
+      setActiveScheduleId(result.nextScheduleId);
+      localStorage.setItem("plan-sheet", String(result.nextScheduleId));
+      toast("Sheet 已删除");
+    } catch (error) {
+      toast(error.message, "error");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function switchSchedule(scheduleId) {
+    if (scheduleId === activeScheduleId) return;
+    setEditor(null);
+    setActiveBatch(null);
+    setActiveScheduleId(scheduleId);
+    localStorage.setItem("plan-sheet", String(scheduleId));
+  }
+
   function toggleTheme() {
     const current = document.documentElement.dataset.theme;
     setTheme(current === "dark" ? "light" : "dark");
   }
+
+  const activeSchedule = schedules.find((item) => item.id === activeScheduleId);
 
   return (
     <DndContext
@@ -601,6 +670,33 @@ function Scheduler({ accessCode, onUnauthorized }) {
           </div>
         </header>
 
+        <nav className="sheetbar" aria-label="排班表切换">
+          <div className="sheet-tabs">
+            {schedules.map((schedule) => (
+              <div className={`sheet-tab-wrap ${schedule.id === activeScheduleId ? "is-active" : ""}`} key={schedule.id}>
+                <button
+                  className="sheet-tab"
+                  type="button"
+                  onClick={() => switchSchedule(schedule.id)}
+                  onDoubleClick={() => setSheetEditor(schedule)}
+                >
+                  <span>{schedule.name}</span>
+                  <small>{schedule.shiftCount} 班</small>
+                </button>
+                {schedule.id === activeScheduleId && (
+                  <button className="sheet-settings" type="button" onClick={() => setSheetEditor(schedule)} aria-label={`设置 ${schedule.name}`}>
+                    <PencilSimple size={13} />
+                  </button>
+                )}
+              </div>
+            ))}
+            <button className="new-sheet" type="button" onClick={() => setSheetEditor({ name: `新排班 ${schedules.length + 1}` })}>
+              <Plus size={14} weight="bold" /> 新建 Sheet
+            </button>
+          </div>
+          <span className="public-sync"><i /> 公开协作 · 自动同步</span>
+        </nav>
+
         <div className="workspace">
           <aside className={`sidebar ${sidebarOpen ? "is-open" : ""}`}>
             <div className="sidebar-scroll">
@@ -609,7 +705,7 @@ function Scheduler({ accessCode, onUnauthorized }) {
                   <div><span className="ai-icon"><Sparkle size={16} weight="fill" /></span><h2>AI 排班</h2></div>
                   <span className="model-badge"><i /> V4 Flash</span>
                 </div>
-                <p>用自然语言说明条件，AI 会直接调整当前月份。</p>
+                <p>用自然语言说明条件，AI 只会调整当前 Sheet 的这个月份。</p>
                 <textarea
                   value={aiPrompt}
                   onChange={(event) => setAiPrompt(event.target.value)}
@@ -663,7 +759,7 @@ function Scheduler({ accessCode, onUnauthorized }) {
                 <button className="icon-button" type="button" onClick={() => setMonth((value) => subMonths(value, 1))} aria-label="上个月"><CaretLeft size={18} /></button>
                 <div>
                   <h1>{format(month, "yyyy年 M月")}</h1>
-                  <p>{staff.length} 人参与排班</p>
+                  <p>{activeSchedule?.name || "排班表"} · {staff.length} 人参与</p>
                 </div>
                 <button className="icon-button" type="button" onClick={() => setMonth((value) => addMonths(value, 1))} aria-label="下个月"><CaretRight size={18} /></button>
               </div>
@@ -712,6 +808,24 @@ function Scheduler({ accessCode, onUnauthorized }) {
       <AnimatePresence>
         {editor && <ShiftEditor initial={editor} staff={staff} onSave={saveShift} onDelete={deleteShift} onClose={() => setEditor(null)} busy={busy} />}
         {staffEditorOpen && <StaffEditor staff={staff} onAdd={addStaff} onUpdate={updateStaff} onClose={() => setStaffEditorOpen(false)} busy={busy} />}
+        {sheetEditor && (
+          <SheetEditor
+            schedule={sheetEditor}
+            onSave={saveSchedule}
+            onDelete={(schedule) => { setSheetEditor(null); setSheetDeleteCandidate(schedule); }}
+            onClose={() => setSheetEditor(null)}
+            busy={busy}
+            canDelete={schedules.length > 1}
+          />
+        )}
+        {sheetDeleteCandidate && (
+          <DeleteSheetConfirm
+            schedule={sheetDeleteCandidate}
+            onConfirm={deleteSchedule}
+            onClose={() => setSheetDeleteCandidate(null)}
+            busy={busy}
+          />
+        )}
       </AnimatePresence>
       <Toasts toasts={toasts} dismiss={dismissToast} />
       {sidebarOpen && <button className="mobile-scrim" type="button" aria-label="关闭面板" onClick={() => setSidebarOpen(false)} />}
@@ -720,10 +834,5 @@ function Scheduler({ accessCode, onUnauthorized }) {
 }
 
 export default function App() {
-  const [accessCode, setAccessCode] = useState(() => localStorage.getItem("plan-access") || "");
-  function logout() {
-    localStorage.removeItem("plan-access");
-    setAccessCode("");
-  }
-  return accessCode ? <Scheduler accessCode={accessCode} onUnauthorized={logout} /> : <Login onSuccess={setAccessCode} />;
+  return <Scheduler />;
 }
