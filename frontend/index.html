@@ -9,10 +9,10 @@
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <script>
       try {
-        const savedTheme = localStorage.getItem("plan-theme") || "system";
-        const dark = savedTheme === "dark" || (savedTheme === "system" && matchMedia("(prefers-color-scheme: dark)").matches);
+        const dark = matchMedia("(prefers-color-scheme: dark)").matches;
         const resolvedTheme = dark ? "dark" : "light";
         const themeColor = dark ? "#171a18" : "#f2f3ef";
+        localStorage.removeItem("plan-theme");
         document.documentElement.dataset.theme = resolvedTheme;
         document.documentElement.style.backgroundColor = themeColor;
         document.querySelector('meta[name="theme-color"]').content = themeColor;
