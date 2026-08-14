@@ -1,0 +1,20 @@
+[Unit]
+Description=Hotel staff scheduler
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=www-data
+WorkingDirectory=/opt/hotel-scheduler/current/backend
+EnvironmentFile=/opt/hotel-scheduler/shared/app.env
+ExecStart=/opt/hotel-scheduler/venv/bin/gunicorn app:app --bind 127.0.0.1:8094 --workers 2 --threads 4 --timeout 90 --access-logfile - --error-logfile -
+Restart=always
+RestartSec=3
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+
