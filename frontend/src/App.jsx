@@ -26,9 +26,9 @@ import { zhCN } from "date-fns/locale";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import {
   ArrowCounterClockwise,
-  CalendarBlank,
   CaretLeft,
   CaretRight,
+  ChartBar,
   Check,
   ClockCountdown,
   CopySimple,
@@ -37,11 +37,8 @@ import {
   EyeSlash,
   GearSix,
   Lightning,
-  Moon,
   PencilSimple,
   Plus,
-  Sparkle,
-  Sun,
   Trash,
   UsersThree,
   X,
@@ -117,7 +114,6 @@ function ShiftCard({ shift, onEdit, ghost = false }) {
       <span className="shift-grip"><DotsSixVertical size={12} weight="bold" /></span>
       <span className="shift-code">{SHIFT_META[shift.code]?.label || shift.code}</span>
       <span className="shift-name">{shift.person}</span>
-      {shift.source === "ai" && <Sparkle className="shift-ai" size={12} weight="fill" />}
     </motion.button>
   );
 }
@@ -183,7 +179,7 @@ function DayCell({ day, currentMonth, shifts, onAdd, onEdit, selected, onSelectS
   );
 }
 
-function MonthlyStats({ metrics, people, aiCount }) {
+function MonthlyStats({ metrics, people }) {
   const totals = [
     ["A 班", metrics.early],
     ["B 班", metrics.late],
@@ -194,7 +190,6 @@ function MonthlyStats({ metrics, people, aiCount }) {
     <section className="stats-board" aria-label="本月排班统计">
       <header>
         <div><strong>本月统计</strong><span>按当前 Sheet 计算</span></div>
-        {aiCount > 0 && <span className="stats-ai"><Sparkle size={12} weight="fill" /> {aiCount} 项由 AI 安排</span>}
       </header>
       <div className="stats-content">
         <div className="stats-totals">
@@ -314,11 +309,41 @@ function ShiftEditor({ initial, staff, onSave, onDelete, onClose, busy }) {
   );
 }
 
-function StaffEditor({ staff, onAdd, onUpdate, onClose, busy }) {
+function SettingsEditor({ staff, rules, onAdd, onUpdate, onUpdateRules, onClose, busy }) {
   const [newName, setNewName] = useState("");
   const [newColor, setNewColor] = useState(STAFF_COLORS[4]);
   return (
-    <Modal title="参与排班的人" subtitle="每个人使用一种固定颜色" onClose={onClose}>
+    <Modal title="排班设置" subtitle="当前 Sheet 的固定规则与参与人员" onClose={onClose}>
+      <section className="rules-editor">
+        <header><strong>固定排班规则</strong><span>当前 Sheet</span></header>
+        <label className="rule-row">
+          <span>
+            <strong>每天 1 个 A、1 个 B</strong>
+            <small>其他人当天休假，AI 生成后会自动校验</small>
+          </span>
+          <input
+            type="checkbox"
+            checked={rules.exactDailyAB}
+            onChange={(event) => onUpdateRules({ ...rules, exactDailyAB: event.target.checked })}
+            disabled={busy}
+          />
+          <i aria-hidden="true" />
+        </label>
+        <label className="rule-row">
+          <span>
+            <strong>休假前 A，收假后 B</strong>
+            <small>连续休假前的最后一班为 A，收假第一班为 B</small>
+          </span>
+          <input
+            type="checkbox"
+            checked={rules.offTransition}
+            onChange={(event) => onUpdateRules({ ...rules, offTransition: event.target.checked })}
+            disabled={busy}
+          />
+          <i aria-hidden="true" />
+        </label>
+      </section>
+      <div className="settings-section-title"><strong>参与人员</strong><span>每人一种颜色</span></div>
       <div className="staff-editor-list">
         {staff.map((person) => (
           <div className="staff-editor-row" key={person.id}>
@@ -443,6 +468,7 @@ function Scheduler() {
   const [activeScheduleId, setActiveScheduleId] = useState(() => Number(localStorage.getItem("plan-sheet")) || null);
   const [staff, setStaff] = useState([]);
   const [shifts, setShifts] = useState([]);
+  const [rules, setRules] = useState({ exactDailyAB: true, offTransition: true });
   const [aiInfo, setAiInfo] = useState({ configured: false, model: "deepseek-v4-flash" });
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
@@ -455,13 +481,14 @@ function Scheduler() {
   const [aiBusy, setAiBusy] = useState(false);
   const [activeBatch, setActiveBatch] = useState(null);
   const [toasts, setToasts] = useState([]);
-  const [theme, setTheme] = useState(() => localStorage.getItem("plan-theme") || "system");
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [statsOpen, setStatsOpen] = useState(false);
   const [hiddenStaffIds, setHiddenStaffIds] = useState(() => new Set());
   const [selectionAnchor, setSelectionAnchor] = useState(null);
   const [selectionEnd, setSelectionEnd] = useState(null);
   const [selectionDragging, setSelectionDragging] = useState(false);
   const longPressTimer = useRef(null);
+  const statsRef = useRef(null);
   const reduceMotion = useReducedMotion();
 
   const gridStart = useMemo(() => startOfWeek(startOfMonth(month), { weekStartsOn: 1 }), [month]);
@@ -502,16 +529,31 @@ function Scheduler() {
     const root = document.documentElement;
     const colorScheme = window.matchMedia("(prefers-color-scheme: dark)");
     const applyTheme = () => {
-      const resolved = theme === "system" ? (colorScheme.matches ? "dark" : "light") : theme;
+      const resolved = colorScheme.matches ? "dark" : "light";
       root.dataset.theme = resolved;
       root.style.backgroundColor = THEME_COLORS[resolved];
       document.querySelector('meta[name="theme-color"]')?.setAttribute("content", THEME_COLORS[resolved]);
     };
     applyTheme();
     colorScheme.addEventListener("change", applyTheme);
-    localStorage.setItem("plan-theme", theme);
+    localStorage.removeItem("plan-theme");
     return () => colorScheme.removeEventListener("change", applyTheme);
-  }, [theme]);
+  }, []);
+
+  useEffect(() => {
+    if (!statsOpen) return undefined;
+    const closeStats = (event) => {
+      if (event.key === "Escape" || (event.type === "pointerdown" && !statsRef.current?.contains(event.target))) {
+        setStatsOpen(false);
+      }
+    };
+    document.addEventListener("pointerdown", closeStats);
+    document.addEventListener("keydown", closeStats);
+    return () => {
+      document.removeEventListener("pointerdown", closeStats);
+      document.removeEventListener("keydown", closeStats);
+    };
+  }, [statsOpen]);
 
   async function loadData({ quiet = false, scheduleId = activeScheduleId } = {}) {
     if (!quiet) setLoading(true);
@@ -523,6 +565,7 @@ function Scheduler() {
       localStorage.setItem("plan-sheet", String(data.activeSchedule.id));
       setStaff(data.staff);
       setShifts(data.shifts);
+      setRules(data.rules);
       setAiInfo(data.ai);
     } catch (error) {
       toast(error.message, "error");
@@ -577,7 +620,6 @@ function Scheduler() {
     work: monthShifts.filter((item) => WORK_SHIFT_CODES.has(item.code)).length,
     off: monthShifts.filter((item) => item.code === "OFF").length,
   }), [monthShifts]);
-  const aiCount = useMemo(() => monthShifts.filter((item) => item.source === "ai").length, [monthShifts]);
   const peopleStats = useMemo(() => staff.map((person) => {
     const personShifts = monthShifts.filter((item) => item.staffId === person.id);
     const early = personShifts.filter((item) => item.code === "A").length;
@@ -639,19 +681,16 @@ function Scheduler() {
   }
 
   async function copySelectionForExcel() {
-    const header = ["日期", "星期", ...staff.map((person) => person.name)];
-    const rows = selectedDates.map((dateValue) => {
-      const dayShifts = shifts.filter((shift) => shift.date === dateValue);
-      return [
-        format(parseISO(dateValue), "M月d日"),
-        format(parseISO(dateValue), "EEE", { locale: zhCN }),
-        ...staff.map((person) => {
-          const code = dayShifts.find((shift) => shift.staffId === person.id)?.code;
-          return WORK_SHIFT_CODES.has(code) ? code : "/";
-        }),
-      ];
-    });
-    const text = [header, ...rows].map((row) => row.join("\t")).join("\n");
+    const dateRow = ["姓名", ...selectedDates.map((dateValue) => format(parseISO(dateValue), "M月d日"))];
+    const weekdayRow = ["星期", ...selectedDates.map((dateValue) => format(parseISO(dateValue), "EEE", { locale: zhCN }))];
+    const personRows = staff.map((person) => [
+      person.name,
+      ...selectedDates.map((dateValue) => {
+        const code = shifts.find((shift) => shift.date === dateValue && shift.staffId === person.id)?.code;
+        return WORK_SHIFT_CODES.has(code) ? code : "/";
+      }),
+    ]);
+    const text = [dateRow, weekdayRow, ...personRows].map((row) => row.join("\t")).join("\n");
     try {
       await navigator.clipboard.writeText(text);
       toast(`已复制 ${selectedDates.length} 天，可直接粘贴到 Excel`);
@@ -659,6 +698,20 @@ function Scheduler() {
       toast("Safari 没有允许复制，请在浏览器设置中允许剪贴板访问", "error");
     }
   }
+
+  useEffect(() => {
+    if (!selectedDates.length) return undefined;
+    const copyWithShortcut = (event) => {
+      const target = event.target;
+      const isEditing = target instanceof HTMLElement
+        && (target.matches("input, textarea, [contenteditable='true']") || target.isContentEditable);
+      if (isEditing || event.key.toLowerCase() !== "c" || (!event.metaKey && !event.ctrlKey)) return;
+      event.preventDefault();
+      copySelectionForExcel();
+    };
+    window.addEventListener("keydown", copyWithShortcut);
+    return () => window.removeEventListener("keydown", copyWithShortcut);
+  }, [selectedDates, shifts, staff]);
 
   async function clearSelectedDates() {
     if (!selectedDates.length) return;
@@ -781,8 +834,8 @@ function Scheduler() {
     setBusy(true);
     try {
       const result = await api("/api/staff", { method: "POST", body: JSON.stringify(value) });
-      setStaff((current) => [...current, result.staff]);
-      toast(`${value.name} 已加入排班`);
+      await loadData({ quiet: true });
+      toast(result.restored ? `${value.name} 已恢复到排班` : `${value.name} 已加入排班`);
     } catch (error) {
       toast(error.message, "error");
       throw error;
@@ -799,6 +852,22 @@ function Scheduler() {
       await loadData({ quiet: true });
     } catch (error) {
       toast(error.message, "error");
+    }
+  }
+
+  async function updateRules(values) {
+    setBusy(true);
+    try {
+      const result = await api(`/api/schedules/${activeScheduleId}/rules`, {
+        method: "PATCH",
+        body: JSON.stringify(values),
+      });
+      setRules(result.rules);
+      toast("固定排班规则已更新");
+    } catch (error) {
+      toast(error.message, "error");
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -853,11 +922,6 @@ function Scheduler() {
     localStorage.setItem("plan-sheet", String(scheduleId));
   }
 
-  function toggleTheme() {
-    const current = document.documentElement.dataset.theme;
-    setTheme(current === "dark" ? "light" : "dark");
-  }
-
   const activeSchedule = schedules.find((item) => item.id === activeScheduleId);
 
   return (
@@ -874,23 +938,6 @@ function Scheduler() {
       }}
     >
       <div className="app-shell">
-        <header className="topbar">
-          <div className="brand">
-            <span className="brand-mark"><CalendarBlank size={20} weight="fill" /></span>
-            <div><strong>栖班</strong><span>酒店人员排班</span></div>
-          </div>
-          <div className="topbar-actions">
-            <button className="secondary-button compact" type="button" onClick={() => setMonth(startOfMonth(new Date()))}>今天</button>
-            <button className="icon-button" type="button" onClick={toggleTheme} aria-label="切换明暗模式">
-              {document.documentElement.dataset.theme === "dark" ? <Sun size={19} /> : <Moon size={19} />}
-            </button>
-            <button className="icon-button mobile-only" type="button" onClick={() => setSidebarOpen((value) => !value)} aria-label="排班设置"><Sparkle size={19} /></button>
-            <button className="primary-button top-add" type="button" onClick={() => setEditor({ date: format(new Date(), "yyyy-MM-dd"), code: "A" })}>
-              <Plus size={17} weight="bold" /> 添加班次
-            </button>
-          </div>
-        </header>
-
         <nav className="sheetbar" aria-label="排班表切换">
           <div className="sheet-tabs">
             {schedules.map((schedule) => (
@@ -916,29 +963,20 @@ function Scheduler() {
             </button>
           </div>
           <span className="public-sync"><i /> 公开协作 · 自动同步</span>
+          <button className="tiny-icon mobile-only sheetbar-panel-toggle" type="button" onClick={() => setSidebarOpen((value) => !value)} aria-label="排班设置"><GearSix size={17} /></button>
         </nav>
 
         <div className="workspace">
           <aside className={`sidebar ${sidebarOpen ? "is-open" : ""}`}>
             <div className="sidebar-scroll">
               <section className="ai-panel">
-                <div className="panel-title">
-                  <div><span className="ai-icon"><Sparkle size={16} weight="fill" /></span><h2>AI 排班</h2></div>
-                  <span className="model-badge"><i /> V4 Flash</span>
-                </div>
-                <p>用自然语言说明条件，AI 只会调整当前 Sheet 的这个月份。</p>
                 <textarea
                   value={aiPrompt}
                   onChange={(event) => setAiPrompt(event.target.value)}
-                  placeholder="例如：每个人最多连续上 4 天，张馨悦周末不排晚班，早晚班尽量平均。"
+                  placeholder="比如：每人最多连上 4 天，XXX 尽量排周末两天休假，早晚班尽量平均，XXX 避免 B 班后紧跟 A 班。"
                   rows={6}
                   disabled={!aiInfo.configured || aiBusy}
                 />
-                <div className="prompt-examples">
-                  {["周末平均轮休", "避免晚班接早班", "每人最多连上4天"].map((example) => (
-                    <button type="button" key={example} onClick={() => setAiPrompt((value) => value ? `${value}；${example}` : example)}>{example}</button>
-                  ))}
-                </div>
                 <button className="ai-generate" type="button" onClick={generateSchedule} disabled={!aiPrompt.trim() || aiBusy || !aiInfo.configured}>
                   {aiBusy ? <><span className="button-loader" /> 正在安排</> : <><Lightning size={17} weight="fill" /> 生成 {format(month, "M月")}排班</>}
                 </button>
@@ -949,7 +987,7 @@ function Scheduler() {
               <section className="people-panel">
                 <div className="panel-title">
                   <div><UsersThree size={18} /><h2>参与人员</h2></div>
-                  <button className="tiny-icon" type="button" onClick={() => setStaffEditorOpen(true)} aria-label="管理参与人员"><GearSix size={16} /></button>
+                  <button className="tiny-icon" type="button" onClick={() => setStaffEditorOpen(true)} aria-label="排班设置"><GearSix size={16} /></button>
                 </div>
                 <div className="people-list">
                   {staff.map((person) => {
@@ -987,12 +1025,6 @@ function Scheduler() {
                 </div>
               </section>
 
-              <section className="shift-legend">
-                <h3>班次说明</h3>
-                {Object.entries(SHIFT_META).map(([code, meta]) => (
-                  <div key={code}><strong>{meta.label}</strong><span>{meta.name}</span><small>{meta.time}</small></div>
-                ))}
-              </section>
             </div>
           </aside>
 
@@ -1006,9 +1038,34 @@ function Scheduler() {
                 </div>
                 <button className="icon-button" type="button" onClick={() => setMonth((value) => addMonths(value, 1))} aria-label="下个月"><CaretRight size={18} /></button>
               </div>
+              <div className="calendar-toolbar-actions" ref={statsRef}>
+                <button
+                  className={`stats-trigger ${statsOpen ? "is-active" : ""}`}
+                  type="button"
+                  onClick={() => setStatsOpen((value) => !value)}
+                  aria-expanded={statsOpen}
+                  aria-haspopup="dialog"
+                >
+                  <ChartBar size={15} /><span>本月统计</span><strong>{metrics.work}</strong>
+                </button>
+                <button className="secondary-button compact today-button" type="button" onClick={() => setMonth(startOfMonth(new Date()))}>今天</button>
+                <AnimatePresence>
+                  {statsOpen && (
+                    <motion.div
+                      className="stats-popover"
+                      initial={reduceMotion ? false : { opacity: 0, y: -6, scale: 0.98 }}
+                      animate={{ opacity: 1, y: 0, scale: 1 }}
+                      exit={{ opacity: 0, y: -4, scale: 0.985 }}
+                      transition={{ duration: 0.2, ease: [0.16, 1, 0.3, 1] }}
+                      role="dialog"
+                      aria-label="本月统计详情"
+                    >
+                      <MonthlyStats metrics={metrics} people={peopleStats} />
+                    </motion.div>
+                  )}
+                </AnimatePresence>
+              </div>
             </div>
-
-            <MonthlyStats metrics={metrics} people={peopleStats} aiCount={aiCount} />
 
             <section className={`calendar-card ${loading ? "is-loading" : ""}`}>
               <div className="weekday-row">
@@ -1059,7 +1116,10 @@ function Scheduler() {
               <small>{format(parseISO(selectedDates[0]), "M月d日")}{selectedDates.length > 1 ? ` – ${format(parseISO(selectedDates.at(-1)), "M月d日")}` : ""}</small>
             </span>
             <i />
-            <button type="button" onClick={copySelectionForExcel}><CopySimple size={16} /> 复制到 Excel</button>
+            <button type="button" onClick={copySelectionForExcel}>
+              <CopySimple size={16} /> 复制到 Excel
+              <kbd>{navigator.userAgent.includes("Mac") ? "⌘ C" : "Ctrl C"}</kbd>
+            </button>
             <button className="is-danger" type="button" onClick={clearSelectedDates} disabled={busy}><Trash size={16} /> 清空</button>
             <button className="selection-close" type="button" onClick={clearDateSelection} aria-label="取消选择"><X size={16} /></button>
           </motion.div>
@@ -1072,7 +1132,17 @@ function Scheduler() {
 
       <AnimatePresence>
         {editor && <ShiftEditor initial={editor} staff={staff} onSave={saveShift} onDelete={deleteShift} onClose={() => setEditor(null)} busy={busy} />}
-        {staffEditorOpen && <StaffEditor staff={staff} onAdd={addStaff} onUpdate={updateStaff} onClose={() => setStaffEditorOpen(false)} busy={busy} />}
+        {staffEditorOpen && (
+          <SettingsEditor
+            staff={staff}
+            rules={rules}
+            onAdd={addStaff}
+            onUpdate={updateStaff}
+            onUpdateRules={updateRules}
+            onClose={() => setStaffEditorOpen(false)}
+            busy={busy}
+          />
+        )}
         {sheetEditor && (
           <SheetEditor
             schedule={sheetEditor}

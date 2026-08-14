@@ -5,7 +5,7 @@ import os
 import sqlite3
 import time
 import uuid
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -99,6 +99,13 @@ def init_database() -> None:
             updated_at TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS schedule_rules (
+            schedule_id INTEGER PRIMARY KEY REFERENCES schedules(id) ON DELETE CASCADE,
+            exact_daily_ab INTEGER NOT NULL DEFAULT 1,
+            off_transition INTEGER NOT NULL DEFAULT 1,
+            updated_at TEXT NOT NULL
+        );
+
         CREATE TABLE IF NOT EXISTS ai_batches (
             id TEXT PRIMARY KEY,
             schedule_id INTEGER,
@@ -126,6 +133,15 @@ def init_database() -> None:
     default_schedule_id = connection.execute(
         "SELECT id FROM schedules ORDER BY sort_order, id LIMIT 1"
     ).fetchone()[0]
+    connection.execute(
+        """
+        INSERT OR IGNORE INTO schedule_rules(
+            schedule_id, exact_daily_ab, off_transition, updated_at
+        )
+        SELECT id, 1, 1, ? FROM schedules
+        """,
+        (now_iso(),),
+    )
 
     shifts_row = connection.execute(
         "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'shifts'"
@@ -302,6 +318,32 @@ def schedule_payload(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
+def rules_payload(row: sqlite3.Row) -> dict[str, bool]:
+    return {
+        "exactDailyAB": bool(row["exact_daily_ab"]),
+        "offTransition": bool(row["off_transition"]),
+    }
+
+
+def fetch_schedule_rules(schedule_id: int) -> sqlite3.Row:
+    row = db().execute(
+        "SELECT * FROM schedule_rules WHERE schedule_id = ?", (schedule_id,)
+    ).fetchone()
+    if row is None:
+        db().execute(
+            """
+            INSERT INTO schedule_rules(
+                schedule_id, exact_daily_ab, off_transition, updated_at
+            ) VALUES (?, 1, 1, ?)
+            """,
+            (schedule_id, now_iso()),
+        )
+        row = db().execute(
+            "SELECT * FROM schedule_rules WHERE schedule_id = ?", (schedule_id,)
+        ).fetchone()
+    return row
+
+
 def shift_payload(row: sqlite3.Row) -> dict[str, Any]:
     return {
         "id": row["id"],
@@ -386,12 +428,14 @@ def bootstrap():
         """,
         (active["id"], start, end),
     ).fetchall()
+    rules = fetch_schedule_rules(active["id"])
     return jsonify(
         {
             "schedules": [schedule_payload(row) for row in schedules],
             "activeSchedule": schedule_payload(active),
             "staff": [staff_payload(row) for row in staff],
             "shifts": [shift_payload(row) for row in shifts],
+            "rules": rules_payload(rules),
             "ai": {"configured": bool(DEEPSEEK_API_KEY), "model": DEEPSEEK_MODEL},
         }
     )
@@ -411,6 +455,14 @@ def add_schedule():
         cursor = db().execute(
             "INSERT INTO schedules(name, sort_order, created_at, updated_at) VALUES (?, ?, ?, ?)",
             (name, next_order, stamp, stamp),
+        )
+        db().execute(
+            """
+            INSERT INTO schedule_rules(
+                schedule_id, exact_daily_ab, off_transition, updated_at
+            ) VALUES (?, 1, 1, ?)
+            """,
+            (cursor.lastrowid, stamp),
         )
         db().commit()
     except sqlite3.IntegrityError:
@@ -440,13 +492,38 @@ def edit_schedule(schedule_id: int):
         return jsonify({"error": "已经有同名排班表"}), 409
     updated = db().execute(
         """
-        SELECT sc.*, COUNT(s.id) AS shift_count
+        SELECT sc.*, COALESCE(SUM(CASE WHEN s.code IN ('A', 'B') THEN 1 ELSE 0 END), 0) AS shift_count
         FROM schedules sc LEFT JOIN shifts s ON s.schedule_id = sc.id
         WHERE sc.id = ? GROUP BY sc.id
         """,
         (schedule_id,),
     ).fetchone()
     return jsonify({"schedule": schedule_payload(updated)})
+
+
+@app.patch("/api/schedules/<int:schedule_id>/rules")
+def edit_schedule_rules(schedule_id: int):
+    if db().execute(
+        "SELECT id FROM schedules WHERE id = ?", (schedule_id,)
+    ).fetchone() is None:
+        return jsonify({"error": "这张排班表已被删除"}), 404
+    current = fetch_schedule_rules(schedule_id)
+    payload = request.get_json(silent=True) or {}
+    exact_daily_ab = bool(payload.get("exactDailyAB", bool(current["exact_daily_ab"])))
+    off_transition = bool(payload.get("offTransition", bool(current["off_transition"])))
+    stamp = now_iso()
+    db().execute(
+        """
+        UPDATE schedule_rules
+        SET exact_daily_ab = ?, off_transition = ?, updated_at = ?
+        WHERE schedule_id = ?
+        """,
+        (int(exact_daily_ab), int(off_transition), stamp, schedule_id),
+    )
+    touch_schedule(schedule_id)
+    db().commit()
+    updated = fetch_schedule_rules(schedule_id)
+    return jsonify({"rules": rules_payload(updated)})
 
 
 @app.delete("/api/schedules/<int:schedule_id>")
@@ -474,6 +551,20 @@ def add_staff():
         return jsonify({"error": "姓名长度应为 1-20 个字符"}), 400
     if not color.startswith("#") or len(color) != 7:
         return jsonify({"error": "颜色格式不正确"}), 400
+    existing = db().execute("SELECT * FROM staff WHERE name = ?", (name,)).fetchone()
+    if existing is not None:
+        if existing["active"]:
+            return jsonify({"error": "这个名字已经存在"}), 409
+        next_order = db().execute(
+            "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM staff"
+        ).fetchone()[0]
+        db().execute(
+            "UPDATE staff SET color = ?, sort_order = ?, active = 1 WHERE id = ?",
+            (color, next_order, existing["id"]),
+        )
+        db().commit()
+        restored = db().execute("SELECT * FROM staff WHERE id = ?", (existing["id"],)).fetchone()
+        return jsonify({"staff": staff_payload(restored), "restored": True}), 200
     try:
         next_order = db().execute(
             "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM staff"
@@ -486,7 +577,7 @@ def add_staff():
     except sqlite3.IntegrityError:
         return jsonify({"error": "这个名字已经存在"}), 409
     row = db().execute("SELECT * FROM staff WHERE id = ?", (cursor.lastrowid,)).fetchone()
-    return jsonify({"staff": staff_payload(row)}), 201
+    return jsonify({"staff": staff_payload(row), "restored": False}), 201
 
 
 @app.patch("/api/staff/<int:staff_id>")
@@ -618,17 +709,32 @@ def bulk_delete_shifts():
     return jsonify({"ok": True, "deleted": counts["total"], "workDeleted": counts["work"]})
 
 
-def ai_system_prompt(staff_names: list[str], start: str, end: str) -> str:
+def ai_system_prompt(
+    staff_names: list[str], start: str, end: str, rules: dict[str, bool]
+) -> str:
+    fixed_rules = []
+    if rules["exactDailyAB"]:
+        fixed_rules.append(
+            "- 范围内每天必须且只能有 1 人 A 班、1 人 B 班，其他所有员工必须为 OFF；必须返回每位员工每一天的记录。"
+        )
+    if rules["offTransition"]:
+        fixed_rules.append(
+            "- 每段连续 OFF 之前的最后一个工作日必须为 A；连续 OFF 结束后的第一个工作日必须为 B。"
+        )
+    fixed_rule_text = "\n".join(fixed_rules) or "- 当前 Sheet 没有启用额外固定规则。"
     return f"""你是一名酒店排班经理。请根据用户条件生成可执行排班。
 
 可用员工：{json.dumps(staff_names, ensure_ascii=False)}
 允许日期：{start} 到 {end}
 班次代码：A=早班，B=晚班，OFF=休假。
 
-规则：
+当前 Sheet 的固定规则（优先级最高，用户条件不能覆盖）：
+{fixed_rule_text}
+
+其他规则：
 1. 只能使用给定员工、日期和班次代码。
 2. 尽量公平分配早晚班，避免连续工作超过 6 天，避免晚班后第二天早班。
-3. 用户明确条件优先。未明确要求覆盖的已有班次应尽量保留。
+3. 在不违反固定规则的前提下，优先满足用户条件。未明确要求覆盖的已有班次应尽量保留。
 4. 每个明确安排为休假的日期请返回 OFF，OFF 会作为正式排班状态保存。
 5. 只输出 JSON，不要使用 Markdown。
 
@@ -671,9 +777,10 @@ def ai_generate():
         "SELECT id, name FROM staff WHERE active = 1 ORDER BY sort_order, id"
     ).fetchall()
     staff_by_name = {row["name"]: row["id"] for row in staff_rows}
+    rule_values = rules_payload(fetch_schedule_rules(schedule_id))
     existing_rows = db().execute(
         """
-        SELECT s.shift_date, s.code, p.name
+        SELECT s.staff_id, s.shift_date, s.code, p.name
         FROM shifts s JOIN staff p ON p.id = s.staff_id
         WHERE s.schedule_id = ? AND s.shift_date BETWEEN ? AND ? AND p.active = 1
         ORDER BY s.shift_date, p.sort_order
@@ -688,6 +795,7 @@ def ai_generate():
         {
             "today": date.today().isoformat(),
             "conditions": prompt,
+            "fixed_rules": rule_values,
             "current_schedule": current_schedule,
         },
         ensure_ascii=False,
@@ -705,7 +813,9 @@ def ai_generate():
                 "messages": [
                     {
                         "role": "system",
-                        "content": ai_system_prompt(list(staff_by_name), start, end),
+                        "content": ai_system_prompt(
+                            list(staff_by_name), start, end, rule_values
+                        ),
                     },
                     {"role": "user", "content": user_message},
                 ],
@@ -760,6 +870,55 @@ def ai_generate():
 
     if not operations:
         return jsonify({"error": "AI 没有返回可执行的班次，请换一种说法"}), 422
+
+    final_codes = {
+        (row["staff_id"], row["shift_date"]): row["code"] for row in existing_rows
+    }
+    final_codes.update(
+        {
+            key: operation["shift"]
+            for key, operation in operations.items()
+        }
+    )
+    staff_ids = [row["id"] for row in staff_rows]
+    range_dates = []
+    cursor_date = start_date
+    while cursor_date <= end_date:
+        range_dates.append(cursor_date.isoformat())
+        cursor_date += timedelta(days=1)
+
+    if rule_values["exactDailyAB"]:
+        for item_date in range_dates:
+            day_codes = [final_codes.get((staff_id, item_date)) for staff_id in staff_ids]
+            if (
+                any(code not in ALLOWED_SHIFT_CODES for code in day_codes)
+                or day_codes.count("A") != 1
+                or day_codes.count("B") != 1
+            ):
+                return jsonify(
+                    {
+                        "error": "AI 没有满足设置中的「每天 1 个 A、1 个 B」规则，请重试"
+                    }
+                ), 422
+
+    if rule_values["offTransition"]:
+        for staff_id in staff_ids:
+            person_codes = [final_codes.get((staff_id, item_date)) for item_date in range_dates]
+            for index in range(1, len(person_codes)):
+                previous_code = person_codes[index - 1]
+                current_code = person_codes[index]
+                if current_code == "OFF" and previous_code in {"A", "B"} and previous_code != "A":
+                    return jsonify(
+                        {
+                            "error": "AI 没有满足设置中的「休假前 A、收假后 B」规则，请重试"
+                        }
+                    ), 422
+                if previous_code == "OFF" and current_code in {"A", "B"} and current_code != "B":
+                    return jsonify(
+                        {
+                            "error": "AI 没有满足设置中的「休假前 A、收假后 B」规则，请重试"
+                        }
+                    ), 422
 
     batch_id = uuid.uuid4().hex
     previous_state = []
