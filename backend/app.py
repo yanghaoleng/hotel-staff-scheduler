@@ -15,12 +15,20 @@ import websocket as websocket_client
 from flask import Flask, g, jsonify, request, send_from_directory
 from flask_sock import Sock
 
-from backend.scheduler_engine import (
-    ScheduleImpossible,
-    build_schedule,
-    heuristic_request,
-    merge_parsed_request,
-)
+try:
+    from .scheduler_engine import (
+        ScheduleImpossible,
+        build_schedule,
+        heuristic_request,
+        merge_parsed_request,
+    )
+except ImportError:
+    from scheduler_engine import (
+        ScheduleImpossible,
+        build_schedule,
+        heuristic_request,
+        merge_parsed_request,
+    )
 
 
 BASE_DIR = Path(__file__).resolve().parent
