@@ -19,7 +19,7 @@ DATABASE_PATH = Path(os.environ.get("PLAN_DATABASE_PATH", BASE_DIR / "data" / "p
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
 DEEPSEEK_MODEL = "deepseek-v4-flash"
-ALLOWED_SHIFT_CODES = {"A", "B", "E"}
+ALLOWED_SHIFT_CODES = {"A", "B", "OFF"}
 AI_COOLDOWN_SECONDS = 12
 
 app = Flask(__name__, static_folder=str(STATIC_DIR), static_url_path="")
@@ -62,7 +62,7 @@ def create_shifts_table(connection: sqlite3.Connection) -> None:
             schedule_id INTEGER NOT NULL REFERENCES schedules(id) ON DELETE CASCADE,
             staff_id INTEGER NOT NULL REFERENCES staff(id) ON DELETE CASCADE,
             shift_date TEXT NOT NULL,
-            code TEXT NOT NULL CHECK(code IN ('A', 'B', 'E')),
+            code TEXT NOT NULL CHECK(code IN ('A', 'B', 'OFF')),
             note TEXT NOT NULL DEFAULT '',
             source TEXT NOT NULL DEFAULT 'manual',
             batch_id TEXT,
@@ -108,6 +108,11 @@ def init_database() -> None:
             created_at TEXT NOT NULL,
             undone_at TEXT
         );
+
+        CREATE TABLE IF NOT EXISTS app_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
         """
     )
 
@@ -122,28 +127,35 @@ def init_database() -> None:
         "SELECT id FROM schedules ORDER BY sort_order, id LIMIT 1"
     ).fetchone()[0]
 
-    shifts_exists = connection.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'shifts'"
+    shifts_row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'shifts'"
     ).fetchone()
-    if shifts_exists and "schedule_id" not in table_columns(connection, "shifts"):
-        connection.execute("PRAGMA foreign_keys = OFF")
-        connection.execute("ALTER TABLE shifts RENAME TO shifts_legacy")
+    shifts_columns = table_columns(connection, "shifts") if shifts_row else set()
+    needs_shift_rebuild = bool(
+        shifts_row
+        and ("schedule_id" not in shifts_columns or "'OFF'" not in shifts_row["sql"])
+    )
+    if needs_shift_rebuild:
+        has_schedule_id = "schedule_id" in shifts_columns
+        connection.execute("DROP INDEX IF EXISTS idx_shifts_schedule_date")
         connection.execute("DROP INDEX IF EXISTS idx_shifts_date")
+        connection.execute("ALTER TABLE shifts RENAME TO shifts_legacy")
         create_shifts_table(connection)
+        schedule_expression = "schedule_id" if has_schedule_id else "?"
         connection.execute(
-            """
+            f"""
             INSERT INTO shifts(
                 id, schedule_id, staff_id, shift_date, code, note,
                 source, batch_id, updated_at
             )
-            SELECT id, ?, staff_id, shift_date, code, note,
-                   source, batch_id, updated_at
+            SELECT id, {schedule_expression}, staff_id, shift_date,
+                   CASE code WHEN 'A' THEN 'A' WHEN 'B' THEN 'B' ELSE 'OFF' END,
+                   note, source, batch_id, updated_at
             FROM shifts_legacy
             """,
-            (default_schedule_id,),
+            () if has_schedule_id else (default_schedule_id,),
         )
         connection.execute("DROP TABLE shifts_legacy")
-        connection.execute("PRAGMA foreign_keys = ON")
     else:
         create_shifts_table(connection)
 
@@ -171,10 +183,10 @@ def init_database() -> None:
             for row in connection.execute("SELECT id, name FROM staff").fetchall()
         }
         seed_shifts = {
-            "李贤英": {10: "B", 11: "A", 12: "A", 15: "B", 16: "B"},
-            "杨敏": {11: "B", 12: "B", 13: "A", 14: "A"},
-            "张馨悦": {10: "A", 13: "B", 14: "B", 15: "A", 16: "A"},
-            "刘东": {10: "A", 11: "E", 12: "A", 13: "A", 14: "A"},
+            "李贤英": {10: "B", 11: "A", 12: "A", 13: "OFF", 14: "OFF", 15: "B", 16: "B"},
+            "杨敏": {10: "OFF", 11: "B", 12: "B", 13: "A", 14: "A", 15: "OFF", 16: "OFF"},
+            "张馨悦": {10: "A", 11: "OFF", 12: "OFF", 13: "B", 14: "B", 15: "A", 16: "A"},
+            "刘东": {10: "A", 11: "OFF", 12: "A", 13: "A", 14: "A", 15: "OFF", 16: "OFF"},
         }
         rows = []
         for person, days in seed_shifts.items():
@@ -197,6 +209,51 @@ def init_database() -> None:
             ) VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             rows,
+        )
+
+    explicit_offs_migrated = connection.execute(
+        "SELECT 1 FROM app_meta WHERE key = 'seed_explicit_offs_v1'"
+    ).fetchone()
+    if explicit_offs_migrated is None:
+        screenshot_codes = {
+            "张馨悦": {10: "A", 11: "OFF", 12: "OFF", 13: "B", 14: "B", 15: "A", 16: "A"},
+            "李贤英": {10: "B", 11: "A", 12: "A", 13: "OFF", 14: "OFF", 15: "B", 16: "B"},
+            "杨敏": {10: "OFF", 11: "B", 12: "B", 13: "A", 14: "A", 15: "OFF", 16: "OFF"},
+            "刘东": {10: "A", 11: "OFF", 12: "A", 13: "A", 14: "A", 15: "OFF", 16: "OFF"},
+        }
+        staff_ids = {
+            row["name"]: row["id"]
+            for row in connection.execute(
+                "SELECT id, name FROM staff WHERE name IN ('张馨悦', '李贤英', '杨敏', '刘东')"
+            ).fetchall()
+        }
+        rows = []
+        for person, days in screenshot_codes.items():
+            if person not in staff_ids:
+                continue
+            for day, code in days.items():
+                rows.append(
+                    (
+                        default_schedule_id,
+                        staff_ids[person],
+                        f"2026-08-{day:02d}",
+                        code,
+                        "来自 Jennie 的排班截图",
+                        "import",
+                        now_iso(),
+                    )
+                )
+        connection.executemany(
+            """
+            INSERT OR IGNORE INTO shifts(
+                schedule_id, staff_id, shift_date, code, note, source, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+        connection.execute(
+            "INSERT INTO app_meta(key, value) VALUES ('seed_explicit_offs_v1', ?)",
+            (now_iso(),),
         )
     connection.commit()
     connection.close()
@@ -272,7 +329,7 @@ def fetch_shift(shift_id: int) -> sqlite3.Row | None:
 def fetch_schedules() -> list[sqlite3.Row]:
     return db().execute(
         """
-        SELECT sc.*, COUNT(s.id) AS shift_count
+        SELECT sc.*, COALESCE(SUM(CASE WHEN s.code IN ('A', 'B') THEN 1 ELSE 0 END), 0) AS shift_count
         FROM schedules sc LEFT JOIN shifts s ON s.schedule_id = sc.id
         GROUP BY sc.id
         ORDER BY sc.sort_order, sc.id
@@ -465,7 +522,7 @@ def add_shift():
     code = str(payload.get("code", "")).upper()
     note = str(payload.get("note", "")).strip()[:200]
     if code not in ALLOWED_SHIFT_CODES:
-        return jsonify({"error": "班次只支持 A、B 或 E"}), 400
+        return jsonify({"error": "班次只支持 A 班、B 班或休假"}), 400
     if db().execute(
         "SELECT id FROM staff WHERE id = ? AND active = 1", (staff_id,)
     ).fetchone() is None:
@@ -500,7 +557,7 @@ def edit_shift(shift_id: int):
     code = str(payload.get("code", existing["code"])).upper()
     note = str(payload.get("note", existing["note"])).strip()[:200]
     if code not in ALLOWED_SHIFT_CODES:
-        return jsonify({"error": "班次只支持 A、B 或 E"}), 400
+        return jsonify({"error": "班次只支持 A 班、B 班或休假"}), 400
     try:
         db().execute(
             """
@@ -527,18 +584,50 @@ def delete_shift(shift_id: int):
     return jsonify({"ok": True})
 
 
+@app.post("/api/shifts/bulk-delete")
+def bulk_delete_shifts():
+    payload = request.get_json(silent=True) or {}
+    try:
+        schedule_id = parse_schedule_id(payload.get("scheduleId"))
+        raw_dates = payload.get("dates")
+        if not isinstance(raw_dates, list) or not 1 <= len(raw_dates) <= 63:
+            raise ValueError("请选择 1-63 个日期")
+        dates = sorted({parse_date(str(value)) for value in raw_dates})
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    placeholders = ",".join("?" for _ in dates)
+    parameters = [schedule_id, *dates]
+    counts = db().execute(
+        f"""
+        SELECT COUNT(*) AS total,
+               COALESCE(SUM(CASE WHEN code IN ('A', 'B') THEN 1 ELSE 0 END), 0) AS work
+        FROM shifts
+        WHERE schedule_id = ? AND shift_date IN ({placeholders})
+        """,
+        parameters,
+    ).fetchone()
+    db().execute(
+        f"DELETE FROM shifts WHERE schedule_id = ? AND shift_date IN ({placeholders})",
+        parameters,
+    )
+    touch_schedule(schedule_id)
+    db().commit()
+    return jsonify({"ok": True, "deleted": counts["total"], "workDeleted": counts["work"]})
+
+
 def ai_system_prompt(staff_names: list[str], start: str, end: str) -> str:
     return f"""你是一名酒店排班经理。请根据用户条件生成可执行排班。
 
 可用员工：{json.dumps(staff_names, ensure_ascii=False)}
 允许日期：{start} 到 {end}
-班次代码：A=早班，B=晚班，OFF=休息。E 只用于保留已有特殊班，不要主动新增。
+班次代码：A=早班，B=晚班，OFF=休假。
 
 规则：
 1. 只能使用给定员工、日期和班次代码。
 2. 尽量公平分配早晚班，避免连续工作超过 6 天，避免晚班后第二天早班。
 3. 用户明确条件优先。未明确要求覆盖的已有班次应尽量保留。
-4. 若需要清除某人某天班次，请显式返回 OFF。
+4. 每个明确安排为休假的日期请返回 OFF，OFF 会作为正式排班状态保存。
 5. 只输出 JSON，不要使用 Markdown。
 
 输出格式：
@@ -687,31 +776,25 @@ def ai_generate():
                 "previous": dict(previous) if previous else None,
             }
         )
-        if operation["shift"] == "OFF":
-            db().execute(
-                "DELETE FROM shifts WHERE schedule_id = ? AND staff_id = ? AND shift_date = ?",
-                (schedule_id, staff_id, item_date),
-            )
-        else:
-            db().execute(
-                """
-                INSERT INTO shifts(
-                    schedule_id, staff_id, shift_date, code, note, source, batch_id, updated_at
-                ) VALUES (?, ?, ?, ?, ?, 'ai', ?, ?)
-                ON CONFLICT(schedule_id, staff_id, shift_date) DO UPDATE SET
-                    code = excluded.code, note = excluded.note, source = 'ai',
-                    batch_id = excluded.batch_id, updated_at = excluded.updated_at
-                """,
-                (
-                    schedule_id,
-                    staff_id,
-                    item_date,
-                    operation["shift"],
-                    operation["reason"],
-                    batch_id,
-                    now_iso(),
-                ),
-            )
+        db().execute(
+            """
+            INSERT INTO shifts(
+                schedule_id, staff_id, shift_date, code, note, source, batch_id, updated_at
+            ) VALUES (?, ?, ?, ?, ?, 'ai', ?, ?)
+            ON CONFLICT(schedule_id, staff_id, shift_date) DO UPDATE SET
+                code = excluded.code, note = excluded.note, source = 'ai',
+                batch_id = excluded.batch_id, updated_at = excluded.updated_at
+            """,
+            (
+                schedule_id,
+                staff_id,
+                item_date,
+                operation["shift"],
+                operation["reason"],
+                batch_id,
+                now_iso(),
+            ),
+        )
     summary = str(result.get("summary", "排班已经按条件生成"))[:240]
     db().execute(
         """
