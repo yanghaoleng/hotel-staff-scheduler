@@ -26,6 +26,7 @@ import { zhCN } from "date-fns/locale";
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import {
   ArrowCounterClockwise,
+  CaretDown,
   CaretLeft,
   CaretRight,
   ChartBar,
@@ -36,6 +37,7 @@ import {
   GearSix,
   Keyboard,
   MagicWand,
+  Microphone,
   PencilSimple,
   Plus,
   Trash,
@@ -82,6 +84,42 @@ function rgba(hex, alpha) {
   const g = (parsed >> 8) & 255;
   const b = parsed & 255;
   return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+}
+
+function resampleToPcm16(input, inputRate, outputRate = 16000) {
+  if (!input.length) return new Int16Array();
+  const ratio = inputRate / outputRate;
+  const length = Math.max(1, Math.round(input.length / ratio));
+  const output = new Int16Array(length);
+  for (let index = 0; index < length; index += 1) {
+    const start = Math.floor(index * ratio);
+    const end = Math.min(input.length, Math.floor((index + 1) * ratio) || start + 1);
+    let sum = 0;
+    for (let source = start; source < end; source += 1) sum += input[source];
+    const sample = Math.max(-1, Math.min(1, sum / Math.max(1, end - start)));
+    output[index] = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
+  }
+  return output;
+}
+
+function pcmToBase64(samples) {
+  const bytes = new Uint8Array(samples.buffer);
+  let binary = "";
+  for (let index = 0; index < bytes.length; index += 1) binary += String.fromCharCode(bytes[index]);
+  return window.btoa(binary);
+}
+
+function transcriptionFromEvent(event) {
+  const candidates = [
+    event?.transcript,
+    event?.text,
+    event?.result?.transcript,
+    event?.result?.text,
+    event?.delta?.transcript,
+    event?.delta?.text,
+    event?.item?.content?.[0]?.transcript,
+  ];
+  return candidates.find((value) => typeof value === "string")?.trim() || "";
 }
 
 function ShiftCard({ shift, onEdit, ghost = false, revealIndex, reduceMotion = false }) {
@@ -590,7 +628,7 @@ function Scheduler() {
   const [staff, setStaff] = useState([]);
   const [shifts, setShifts] = useState([]);
   const [rules, setRules] = useState({ exactDailyAB: true, offTransition: true });
-  const [aiInfo, setAiInfo] = useState({ configured: false, model: "deepseek-v4-flash" });
+  const [speechInfo, setSpeechInfo] = useState({ configured: false });
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [activeShift, setActiveShift] = useState(null);
@@ -599,6 +637,8 @@ function Scheduler() {
   const [sheetEditor, setSheetEditor] = useState(null);
   const [sheetDeleteCandidate, setSheetDeleteCandidate] = useState(null);
   const [aiPrompt, setAiPrompt] = useState("");
+  const [aiPanelOpen, setAiPanelOpen] = useState(false);
+  const [selectionAiOpen, setSelectionAiOpen] = useState(false);
   const [aiBusy, setAiBusy] = useState(false);
   const [activeBatch, setActiveBatch] = useState(null);
   const [toasts, setToasts] = useState([]);
@@ -611,11 +651,25 @@ function Scheduler() {
   const [selectionDragging, setSelectionDragging] = useState(false);
   const [quickAdd, setQuickAdd] = useState(null);
   const [aiRevealOrder, setAiRevealOrder] = useState(() => new Map());
+  const [selectionToolbarPosition, setSelectionToolbarPosition] = useState(null);
+  const [voiceTarget, setVoiceTarget] = useState(null);
+  const [voiceStatus, setVoiceStatus] = useState("idle");
   const longPressTimer = useRef(null);
   const aiRevealTimer = useRef(null);
   const statsRef = useRef(null);
   const shortcutsRef = useRef(null);
   const clearUndoRef = useRef(null);
+  const calendarCardRef = useRef(null);
+  const selectionToolbarRef = useRef(null);
+  const selectionAiInputRef = useRef(null);
+  const voiceSocketRef = useRef(null);
+  const voiceStreamRef = useRef(null);
+  const voiceContextRef = useRef(null);
+  const voiceProcessorRef = useRef(null);
+  const voiceBaseRef = useRef("");
+  const voiceTranscriptRef = useRef("");
+  const voiceCloseTimerRef = useRef(null);
+  const voiceSessionRef = useRef(0);
   const reduceMotion = useReducedMotion();
 
   const gridStart = useMemo(() => startOfWeek(startOfMonth(month), { weekStartsOn: 1 }), [month]);
@@ -635,6 +689,7 @@ function Scheduler() {
     return days.slice(from, to + 1).map((day) => format(day, "yyyy-MM-dd"));
   }, [dayIndexByIso, days, selectionAnchor, selectionEnd]);
   const selectedDateSet = useMemo(() => new Set(selectedDates), [selectedDates]);
+  const selectionKey = selectedDates.join("|");
   const startIso = format(gridStart, "yyyy-MM-dd");
   const endIso = format(gridEnd, "yyyy-MM-dd");
   const sensors = useSensors(
@@ -651,6 +706,137 @@ function Scheduler() {
 
   function dismissToast(id) {
     setToasts((current) => current.filter((item) => item.id !== id));
+  }
+
+  function releaseVoiceAudio() {
+    if (voiceProcessorRef.current) {
+      voiceProcessorRef.current.onaudioprocess = null;
+      voiceProcessorRef.current.disconnect();
+      voiceProcessorRef.current = null;
+    }
+    voiceStreamRef.current?.getTracks().forEach((track) => track.stop());
+    voiceStreamRef.current = null;
+    if (voiceContextRef.current) {
+      voiceContextRef.current.close().catch(() => {});
+      voiceContextRef.current = null;
+    }
+  }
+
+  function closeVoiceSession() {
+    voiceSessionRef.current += 1;
+    window.clearTimeout(voiceCloseTimerRef.current);
+    releaseVoiceAudio();
+    voiceSocketRef.current?.close();
+    voiceSocketRef.current = null;
+    setVoiceTarget(null);
+    setVoiceStatus("idle");
+  }
+
+  function stopVoiceInput({ commit = true } = {}) {
+    voiceSessionRef.current += 1;
+    const socket = voiceSocketRef.current;
+    releaseVoiceAudio();
+    if (socket?.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ type: commit ? "commit" : "cancel" }));
+      if (commit) {
+        setVoiceStatus("finishing");
+        window.clearTimeout(voiceCloseTimerRef.current);
+        voiceCloseTimerRef.current = window.setTimeout(closeVoiceSession, 6000);
+        return;
+      }
+    }
+    closeVoiceSession();
+  }
+
+  async function startVoiceInput(target) {
+    if (voiceTarget === target) {
+      stopVoiceInput();
+      return;
+    }
+    if (voiceTarget) stopVoiceInput({ commit: false });
+    if (!speechInfo.configured) {
+      toast("服务器还未配置语音输入", "error");
+      return;
+    }
+    if (!navigator.mediaDevices?.getUserMedia) {
+      toast("当前浏览器不支持麦克风输入", "error");
+      return;
+    }
+
+    setVoiceTarget(target);
+    setVoiceStatus("connecting");
+    const session = voiceSessionRef.current + 1;
+    voiceSessionRef.current = session;
+    voiceBaseRef.current = aiPrompt.trimEnd();
+    voiceTranscriptRef.current = "";
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
+      });
+      if (voiceSessionRef.current !== session) {
+        stream.getTracks().forEach((track) => track.stop());
+        return;
+      }
+      voiceStreamRef.current = stream;
+      const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+      const context = new AudioContextClass();
+      voiceContextRef.current = context;
+      await context.resume();
+      if (voiceSessionRef.current !== session) {
+        releaseVoiceAudio();
+        return;
+      }
+      const source = context.createMediaStreamSource(stream);
+      const processor = context.createScriptProcessor(4096, 1, 1);
+      voiceProcessorRef.current = processor;
+      source.connect(processor);
+      processor.connect(context.destination);
+
+      const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+      const socket = new WebSocket(`${protocol}//${window.location.host}/api/asr/stream`);
+      voiceSocketRef.current = socket;
+      socket.addEventListener("open", () => {
+        if (voiceSocketRef.current !== socket || voiceSessionRef.current !== session) return;
+        setVoiceStatus("listening");
+      });
+      socket.addEventListener("message", (message) => {
+        let event;
+        try {
+          event = JSON.parse(message.data);
+        } catch {
+          return;
+        }
+        if (event.type === "error") {
+          toast(event.message || "语音输入暂不可用", "error");
+          closeVoiceSession();
+          return;
+        }
+        const transcript = transcriptionFromEvent(event);
+        if (transcript) {
+          voiceTranscriptRef.current = transcript;
+          const separator = voiceBaseRef.current && !/\s$/.test(voiceBaseRef.current) ? " " : "";
+          setAiPrompt(`${voiceBaseRef.current}${separator}${transcript}`);
+        }
+        if (event.type === "conversation.item.input_audio_transcription.completed") closeVoiceSession();
+      });
+      socket.addEventListener("close", () => {
+        if (voiceSocketRef.current === socket) closeVoiceSession();
+      });
+      socket.addEventListener("error", () => {
+        if (voiceSocketRef.current !== socket) return;
+        toast("语音服务连接失败，请稍后再试", "error");
+        closeVoiceSession();
+      });
+      processor.onaudioprocess = (event) => {
+        if (socket.readyState !== WebSocket.OPEN) return;
+        const pcm = resampleToPcm16(event.inputBuffer.getChannelData(0), context.sampleRate);
+        if (pcm.length) socket.send(JSON.stringify({ type: "audio", audio: pcmToBase64(pcm) }));
+      };
+    } catch (error) {
+      closeVoiceSession();
+      const denied = error?.name === "NotAllowedError" || error?.name === "SecurityError";
+      toast(denied ? "请允许浏览器使用麦克风" : "麦克风没有成功启动", "error");
+    }
   }
 
   useEffect(() => {
@@ -724,7 +910,7 @@ function Scheduler() {
       }
       setShifts(data.shifts);
       setRules(data.rules);
-      setAiInfo(data.ai);
+      setSpeechInfo(data.speech || { configured: false });
       return data;
     } catch (error) {
       toast(error.message, "error");
@@ -754,16 +940,82 @@ function Scheduler() {
   useEffect(() => () => {
     window.clearTimeout(longPressTimer.current);
     window.clearTimeout(aiRevealTimer.current);
+    window.clearTimeout(voiceCloseTimerRef.current);
+    voiceProcessorRef.current?.disconnect();
+    voiceStreamRef.current?.getTracks().forEach((track) => track.stop());
+    voiceContextRef.current?.close().catch(() => {});
+    if (voiceSocketRef.current?.readyState === WebSocket.OPEN) {
+      voiceSocketRef.current.send(JSON.stringify({ type: "cancel" }));
+    }
+    voiceSocketRef.current?.close();
   }, []);
 
   useEffect(() => {
     setSelectionAnchor(null);
     setSelectionEnd(null);
     setSelectionDragging(false);
+    setSelectionAiOpen(false);
+    setSelectionToolbarPosition(null);
     setQuickAdd(null);
     setAiRevealOrder(new Map());
     window.clearTimeout(aiRevealTimer.current);
   }, [activeScheduleId, month]);
+
+  useEffect(() => {
+    if (!selectionKey) {
+      setSelectionToolbarPosition(null);
+      return undefined;
+    }
+    let frame = 0;
+    const updatePosition = () => {
+      window.cancelAnimationFrame(frame);
+      frame = window.requestAnimationFrame(() => {
+        const card = calendarCardRef.current;
+        const toolbar = selectionToolbarRef.current;
+        if (!card || !toolbar) return;
+        const cells = selectedDates
+          .map((item) => card.querySelector(`[data-date="${item}"]`))
+          .filter(Boolean);
+        if (!cells.length) return;
+        const rects = cells.map((cell) => cell.getBoundingClientRect());
+        const cardRect = card.getBoundingClientRect();
+        const toolbarRect = toolbar.getBoundingClientRect();
+        const union = {
+          left: Math.min(...rects.map((rect) => rect.left)),
+          right: Math.max(...rects.map((rect) => rect.right)),
+          top: Math.min(...rects.map((rect) => rect.top)),
+          bottom: Math.max(...rects.map((rect) => rect.bottom)),
+        };
+        const space = 10;
+        const fitsBelow = window.innerHeight - union.bottom >= toolbarRect.height + space + 8;
+        const fitsAbove = union.top >= toolbarRect.height + space + 8;
+        const placement = fitsBelow || !fitsAbove ? "below" : "above";
+        let top = placement === "below"
+          ? union.bottom - cardRect.top + space
+          : union.top - cardRect.top - toolbarRect.height - space;
+        const viewportTop = 8 - cardRect.top;
+        const viewportBottom = window.innerHeight - cardRect.top - toolbarRect.height - 8;
+        top = Math.max(viewportTop, Math.min(top, viewportBottom));
+        const desiredLeft = (union.left + union.right) / 2 - cardRect.left;
+        const left = Math.max(8, Math.min(desiredLeft - toolbarRect.width / 2, cardRect.width - toolbarRect.width - 8));
+        setSelectionToolbarPosition({ left, top, placement });
+      });
+    };
+    updatePosition();
+    const observer = new ResizeObserver(updatePosition);
+    if (calendarCardRef.current) observer.observe(calendarCardRef.current);
+    if (selectionToolbarRef.current) observer.observe(selectionToolbarRef.current);
+    window.addEventListener("resize", updatePosition);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      observer.disconnect();
+      window.removeEventListener("resize", updatePosition);
+    };
+  }, [selectionAiOpen, selectionKey]);
+
+  useEffect(() => {
+    if (selectionAiOpen) selectionAiInputRef.current?.focus();
+  }, [selectionAiOpen]);
 
   useEffect(() => {
     if (!quickAdd) return undefined;
@@ -874,6 +1126,8 @@ function Scheduler() {
     setSelectionAnchor(null);
     setSelectionEnd(null);
     setSelectionDragging(false);
+    setSelectionAiOpen(false);
+    setSelectionToolbarPosition(null);
   }
 
   async function copySelectionForExcel() {
@@ -1064,16 +1318,24 @@ function Scheduler() {
     }
   }
 
-  async function generateSchedule() {
+  async function generateSchedule({ start = startOfMonth(month), end = endOfMonth(month), scopeLocked = false } = {}) {
     if (!aiPrompt.trim()) return;
+    if (voiceTarget) stopVoiceInput();
     setAiBusy(true);
     try {
       const result = await api("/api/ai/generate", {
         method: "POST",
-        body: JSON.stringify({ scheduleId: activeScheduleId, prompt: aiPrompt.trim(), start: format(startOfMonth(month), "yyyy-MM-dd"), end: format(endOfMonth(month), "yyyy-MM-dd") }),
+        body: JSON.stringify({
+          scheduleId: activeScheduleId,
+          prompt: aiPrompt.trim(),
+          start: format(start, "yyyy-MM-dd"),
+          end: format(end, "yyyy-MM-dd"),
+          scopeLocked,
+        }),
       });
       setActiveBatch(result.batchId);
       setAiPrompt("");
+      setSelectionAiOpen(false);
       const revealKeys = new Set(
         (result.created || []).map((item) => `${item.staffId}:${item.date}`),
       );
@@ -1192,6 +1454,27 @@ function Scheduler() {
     localStorage.setItem("plan-sheet", String(scheduleId));
   }
 
+  function voiceButton(target) {
+    const active = voiceTarget === target;
+    const label = active
+      ? voiceStatus === "finishing" ? "正在整理语音" : "停止语音输入"
+      : "开始语音输入";
+    return (
+      <button
+        className={`voice-trigger ${active ? "is-active" : ""}`}
+        type="button"
+        onClick={() => startVoiceInput(target)}
+        disabled={!speechInfo.configured || aiBusy || voiceStatus === "finishing"}
+        aria-label={label}
+        title={label}
+        aria-pressed={active}
+      >
+        <Microphone size={16} weight={active ? "fill" : "regular"} />
+        {active && voiceStatus === "listening" && <span className="voice-pulse" />}
+      </button>
+    );
+  }
+
   return (
     <DndContext
       sensors={sensors}
@@ -1279,23 +1562,48 @@ function Scheduler() {
           <aside className="sidebar">
             <div className="sidebar-scroll">
               <section className="ai-panel">
-                <textarea
-                  value={aiPrompt}
-                  onChange={(event) => setAiPrompt(event.target.value)}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
-                      event.preventDefault();
-                      if (aiPrompt.trim() && !aiBusy && aiInfo.configured) generateSchedule();
-                    }
-                  }}
-                  placeholder="比如：每人最多连上 4 天，XXX 尽量排周末两天休假，早晚班尽量平均，XXX 避免 B 班后紧跟 A 班。"
-                  rows={6}
-                  disabled={!aiInfo.configured || aiBusy}
-                />
-                <button className="ai-generate" type="button" onClick={generateSchedule} disabled={!aiPrompt.trim() || aiBusy || !aiInfo.configured}>
-                  {aiBusy ? <><span className="button-loader" /> 正在安排</> : <><MagicWand size={17} weight="fill" /> 生成 {format(month, "M月")}排班</>}
+                <button
+                  className={`ai-panel-trigger ${aiPanelOpen ? "is-open" : ""}`}
+                  type="button"
+                  onClick={() => setAiPanelOpen((value) => !value)}
+                  aria-expanded={aiPanelOpen}
+                >
+                  <span><MagicWand size={17} weight="fill" /> 智能排班</span>
+                  <CaretDown size={15} />
                 </button>
-                {!aiInfo.configured && <p className="ai-warning">服务器还未配置 AI 密钥</p>}
+                <AnimatePresence initial={false}>
+                  {aiPanelOpen && (
+                    <motion.div
+                      className="ai-composer"
+                      initial={reduceMotion ? false : { opacity: 0, height: 0 }}
+                      animate={{ opacity: 1, height: "auto" }}
+                      exit={{ opacity: 0, height: 0 }}
+                      transition={{ duration: 0.2, ease: [0.16, 1, 0.3, 1] }}
+                    >
+                      <label htmlFor="month-ai-prompt">排班条件</label>
+                      <div className="prompt-field">
+                        <textarea
+                          id="month-ai-prompt"
+                          value={aiPrompt}
+                          onChange={(event) => setAiPrompt(event.target.value)}
+                          onKeyDown={(event) => {
+                            if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
+                              event.preventDefault();
+                              if (aiPrompt.trim() && !aiBusy) generateSchedule();
+                            }
+                          }}
+                          placeholder="比如：每人最多连上 4 天，XXX 尽量排周末两天休假，早晚班尽量平均，XXX 避免 B 班后紧跟 A 班。"
+                          rows={5}
+                          disabled={aiBusy}
+                        />
+                        {voiceButton("month")}
+                      </div>
+                      <button className="ai-generate" type="button" onClick={() => generateSchedule()} disabled={!aiPrompt.trim() || aiBusy}>
+                        {aiBusy ? <><span className="button-loader" /> 正在安排</> : <><MagicWand size={17} weight="fill" /> 生成 {format(month, "M月")}排班</>}
+                      </button>
+                    </motion.div>
+                  )}
+                </AnimatePresence>
                 {activeBatch && <button className="undo-link" type="button" onClick={() => undoAi()}><ArrowCounterClockwise size={14} /> 撤销最近一次 AI 排班</button>}
               </section>
 
@@ -1381,7 +1689,7 @@ function Scheduler() {
               </div>
             </div>
 
-            <section className={`calendar-card ${loading ? "is-loading" : ""}`}>
+            <section ref={calendarCardRef} className={`calendar-card ${loading ? "is-loading" : ""}`}>
               <div className="weekday-row">
                 {WEEKDAYS.map((day, index) => <div key={day} className={index > 4 ? "is-weekend" : ""}>{day}</div>)}
               </div>
@@ -1417,35 +1725,106 @@ function Scheduler() {
                   <div /><div /><div /><div />
                 </div>
               )}
+              <AnimatePresence>
+                {selectedDates.length > 0 && (
+                  <motion.div
+                    ref={selectionToolbarRef}
+                    className={`selection-toolbar is-${selectionToolbarPosition?.placement || "below"}`}
+                    style={{
+                      left: selectionToolbarPosition?.left ?? 8,
+                      top: selectionToolbarPosition?.top ?? 8,
+                      visibility: selectionToolbarPosition ? "visible" : "hidden",
+                    }}
+                    initial={reduceMotion ? false : { opacity: 0, y: 8, scale: 0.98 }}
+                    animate={{ opacity: 1, y: 0, scale: 1 }}
+                    exit={{ opacity: 0, y: 6, scale: 0.98 }}
+                    transition={{ duration: 0.2, ease: [0.16, 1, 0.3, 1] }}
+                    role="toolbar"
+                    aria-label="所选日期操作"
+                  >
+                    <div className="selection-toolbar-main">
+                      <span className="selection-summary">
+                        <span><strong>{selectedDates.length}</strong> 天</span>
+                        <small>{format(parseISO(selectedDates[0]), "M月d日")}{selectedDates.length > 1 ? ` - ${format(parseISO(selectedDates.at(-1)), "M月d日")}` : ""}</small>
+                      </span>
+                      <div className="selection-actions">
+                        <button type="button" onClick={copySelectionForExcel}>
+                          <CopySimple size={16} /> 复制到 Excel
+                        </button>
+                        <button className="is-danger" type="button" onClick={clearSelectedDates} disabled={busy}><Trash size={16} /> 清空</button>
+                        <button
+                          className={selectionAiOpen ? "is-active" : ""}
+                          type="button"
+                          onClick={() => setSelectionAiOpen((value) => !value)}
+                          aria-expanded={selectionAiOpen}
+                        >
+                          <MagicWand size={16} weight="fill" /> 智能排班
+                        </button>
+                        <button className="selection-close" type="button" onClick={clearDateSelection} aria-label="取消选择"><X size={16} /></button>
+                      </div>
+                    </div>
+                    <AnimatePresence initial={false}>
+                      {selectionAiOpen && (
+                        <motion.div
+                          className="selection-ai-composer"
+                          initial={reduceMotion ? false : { opacity: 0, height: 0 }}
+                          animate={{ opacity: 1, height: "auto" }}
+                          exit={{ opacity: 0, height: 0 }}
+                          transition={{ duration: 0.18, ease: [0.16, 1, 0.3, 1] }}
+                        >
+                          <label htmlFor="selection-ai-prompt">排班条件</label>
+                          <div className="selection-prompt-row">
+                            <div className="prompt-field">
+                              <textarea
+                                ref={selectionAiInputRef}
+                                id="selection-ai-prompt"
+                                value={aiPrompt}
+                                onChange={(event) => setAiPrompt(event.target.value)}
+                                onKeyDown={(event) => {
+                                  if (event.key === "Escape") {
+                                    event.stopPropagation();
+                                    setSelectionAiOpen(false);
+                                  } else if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
+                                    event.preventDefault();
+                                    if (aiPrompt.trim() && !aiBusy) {
+                                      generateSchedule({
+                                        start: parseISO(selectedDates[0]),
+                                        end: parseISO(selectedDates.at(-1)),
+                                        scopeLocked: true,
+                                      });
+                                    }
+                                  }
+                                }}
+                                placeholder="输入这段日期的排班条件"
+                                rows={2}
+                                disabled={aiBusy}
+                              />
+                              {voiceButton("selection")}
+                            </div>
+                            <button
+                              className="selection-generate"
+                              type="button"
+                              onClick={() => generateSchedule({
+                                start: parseISO(selectedDates[0]),
+                                end: parseISO(selectedDates.at(-1)),
+                                scopeLocked: true,
+                              })}
+                              disabled={!aiPrompt.trim() || aiBusy}
+                              aria-label="生成选中日期的排班"
+                            >
+                              {aiBusy ? <span className="button-loader dark" /> : <MagicWand size={17} weight="fill" />}
+                            </button>
+                          </div>
+                        </motion.div>
+                      )}
+                    </AnimatePresence>
+                  </motion.div>
+                )}
+              </AnimatePresence>
             </section>
           </main>
         </div>
       </div>
-
-      <AnimatePresence>
-        {selectedDates.length > 0 && (
-          <motion.div
-            className="selection-toolbar"
-            initial={reduceMotion ? false : { opacity: 0, y: 14, scale: 0.97 }}
-            animate={{ opacity: 1, y: 0, scale: 1 }}
-            exit={{ opacity: 0, y: 8, scale: 0.98 }}
-            transition={{ duration: 0.22, ease: [0.16, 1, 0.3, 1] }}
-            role="toolbar"
-            aria-label="所选日期操作"
-          >
-            <span>
-              <strong>{selectedDates.length}</strong> 天
-              <small>{format(parseISO(selectedDates[0]), "M月d日")}{selectedDates.length > 1 ? ` - ${format(parseISO(selectedDates.at(-1)), "M月d日")}` : ""}</small>
-            </span>
-            <i />
-            <button type="button" onClick={copySelectionForExcel}>
-              <CopySimple size={16} /> 复制到 Excel
-            </button>
-            <button className="is-danger" type="button" onClick={clearSelectedDates} disabled={busy}><Trash size={16} /> 清空</button>
-            <button className="selection-close" type="button" onClick={clearDateSelection} aria-label="取消选择"><X size={16} /></button>
-          </motion.div>
-        )}
-      </AnimatePresence>
 
       <DragOverlay dropAnimation={{ duration: reduceMotion ? 0 : 220, easing: "cubic-bezier(0.16, 1, 0.3, 1)" }}>
         {activeShift ? <ShiftCard shift={activeShift} onEdit={() => {}} ghost /> : null}

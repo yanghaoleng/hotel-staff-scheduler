@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import threading
 import time
 import uuid
 from datetime import date, datetime, timedelta
@@ -10,7 +11,16 @@ from pathlib import Path
 from typing import Any
 
 import requests
+import websocket as websocket_client
 from flask import Flask, g, jsonify, request, send_from_directory
+from flask_sock import Sock
+
+from backend.scheduler_engine import (
+    ScheduleImpossible,
+    build_schedule,
+    heuristic_request,
+    merge_parsed_request,
+)
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -19,11 +29,14 @@ DATABASE_PATH = Path(os.environ.get("PLAN_DATABASE_PATH", BASE_DIR / "data" / "p
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
 DEEPSEEK_MODEL = "deepseek-v4-flash"
+DOUBAO_ASR_API_KEY = os.environ.get("DOUBAO_ASR_API_KEY", "")
+DOUBAO_ASR_URL = "wss://ai-gateway.vei.volces.com/v1/realtime?model=bigmodel"
 ALLOWED_SHIFT_CODES = {"A", "B", "OFF"}
 AI_COOLDOWN_SECONDS = 12
 
 app = Flask(__name__, static_folder=str(STATIC_DIR), static_url_path="")
 app.config["JSON_AS_ASCII"] = False
+sock = Sock(app)
 
 _ai_calls: dict[str, float] = {}
 
@@ -388,6 +401,7 @@ def health():
             "ok": True,
             "service": "hotel-staff-scheduler",
             "aiConfigured": bool(DEEPSEEK_API_KEY),
+            "speechConfigured": bool(DOUBAO_ASR_API_KEY),
             "model": DEEPSEEK_MODEL,
             "access": "public",
         }
@@ -437,8 +451,107 @@ def bootstrap():
             "shifts": [shift_payload(row) for row in shifts],
             "rules": rules_payload(rules),
             "ai": {"configured": bool(DEEPSEEK_API_KEY), "model": DEEPSEEK_MODEL},
+            "speech": {"configured": bool(DOUBAO_ASR_API_KEY)},
         }
     )
+
+
+@sock.route("/api/asr/stream")
+def asr_stream(client):
+    if not DOUBAO_ASR_API_KEY:
+        client.send(json.dumps({"type": "error", "message": "服务器尚未配置语音识别"}, ensure_ascii=False))
+        return
+
+    upstream = None
+    stopped = threading.Event()
+    completed = threading.Event()
+
+    def send_client(message: str) -> None:
+        if stopped.is_set():
+            return
+        try:
+            client.send(message)
+        except Exception:
+            stopped.set()
+
+    try:
+        upstream = websocket_client.create_connection(
+            DOUBAO_ASR_URL,
+            header=[f"Authorization: Bearer {DOUBAO_ASR_API_KEY}"],
+            timeout=12,
+        )
+        upstream.send(
+            json.dumps(
+                {
+                    "type": "transcription_session.update",
+                    "session": {
+                        "input_audio_format": "pcm",
+                        "input_audio_codec": "raw",
+                        "input_audio_sample_rate": 16000,
+                        "input_audio_bits": 16,
+                        "input_audio_channel": 1,
+                        "result_type": 0,
+                        "input_audio_transcription": {"model": "bigmodel"},
+                        "turn_detection": None,
+                    },
+                }
+            )
+        )
+
+        def receive_upstream() -> None:
+            try:
+                while not stopped.is_set():
+                    message = upstream.recv()
+                    if not message:
+                        break
+                    send_client(message)
+                    try:
+                        event = json.loads(message)
+                    except (TypeError, json.JSONDecodeError):
+                        continue
+                    if event.get("type") == "conversation.item.input_audio_transcription.completed":
+                        completed.set()
+                        break
+                    if event.get("type") == "error":
+                        completed.set()
+                        break
+            except Exception as exc:
+                if not stopped.is_set():
+                    send_client(json.dumps({"type": "error", "message": f"语音识别连接中断：{str(exc)[:100]}"}, ensure_ascii=False))
+            finally:
+                completed.set()
+
+        receiver = threading.Thread(target=receive_upstream, daemon=True)
+        receiver.start()
+
+        while not stopped.is_set():
+            raw = client.receive()
+            if raw is None:
+                break
+            try:
+                event = json.loads(raw)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            event_type = event.get("type")
+            if event_type == "audio":
+                audio = event.get("audio")
+                if isinstance(audio, str) and len(audio) <= 180000:
+                    upstream.send(json.dumps({"type": "input_audio_buffer.append", "audio": audio}))
+            elif event_type == "commit":
+                upstream.send(json.dumps({"type": "input_audio_buffer.commit"}))
+                completed.wait(12)
+                break
+            elif event_type == "cancel":
+                break
+    except Exception as exc:
+        send_client(json.dumps({"type": "error", "message": f"语音识别暂不可用：{str(exc)[:100]}"}, ensure_ascii=False))
+    finally:
+        stopped.set()
+        if upstream is not None:
+            try:
+                upstream.close()
+            except Exception:
+                pass
 
 
 @app.post("/api/schedules")
@@ -816,56 +929,55 @@ def bulk_restore_shifts():
     )
 
 
-def ai_system_prompt(
-    staff_names: list[str], start: str, end: str, rules: dict[str, bool]
+def ai_parser_prompt(
+    staff_names: list[str], start: str, end: str, scope_locked: bool
 ) -> str:
-    fixed_rules = []
-    if rules["exactDailyAB"]:
-        fixed_rules.append(
-            "- 范围内每天必须且只能有 1 人 A 班、1 人 B 班，其他所有员工必须为 OFF；必须返回每位员工每一天的记录。"
-        )
-    if rules["offTransition"]:
-        fixed_rules.append(
-            "- 每段连续 OFF 之前的最后一个工作日必须为 A；连续 OFF 结束后的第一个工作日必须为 B。"
-        )
-    fixed_rule_text = "\n".join(fixed_rules) or "- 当前 Sheet 没有启用额外固定规则。"
-    return f"""你是一名酒店排班经理。请根据用户条件生成可执行排班。
+    scope_instruction = (
+        "目标范围已经由用户框选，target 必须原样返回允许日期。"
+        if scope_locked
+        else "如果用户说本周、下周或指定日期，请把 target 解析成允许日期内的精确范围。"
+    )
+    return f"""你只负责把自然语言排班需求解析成 JSON 规则，不负责生成排班表。
 
+今天：{date.today().isoformat()}
 可用员工：{json.dumps(staff_names, ensure_ascii=False)}
 允许日期：{start} 到 {end}
-班次代码：A=早班，B=晚班，OFF=休假。
+{scope_instruction}
 
-当前 Sheet 的固定规则（优先级最高，用户条件不能覆盖）：
-{fixed_rule_text}
-
-其他规则：
-1. 只能使用给定员工、日期和班次代码。
-2. 尽量公平分配早晚班，避免连续工作超过 6 天，避免晚班后第二天早班。
-3. 在不违反固定规则的前提下，优先满足用户条件。未明确要求覆盖的已有班次应尽量保留。
-4. 每个明确安排为休假的日期请返回 OFF，OFF 会作为正式排班状态保存。
-5. 只输出 JSON，不要使用 Markdown。
+解析要求：
+1. 明确休假写入 offDates，使用 YYYY-MM-DD。
+2. 明确 A 班、B 班或休假写入 assignments，班次只能是 A、B、OFF。
+3. 每人最大连续工作天数写入对应人员；没有指定则为 null。
+4. 全局条件只解析最大连班、工作量均衡、早晚班均衡、避免 B 后接 A、保留已有排班。
+5. 不得创造员工、日期或用户没有表达的硬性要求。
+6. 只输出 JSON，不使用 Markdown。
 
 输出格式：
 {{
   "summary": "一句简短中文说明",
-  "schedule": [
-    {{"date": "YYYY-MM-DD", "person": "姓名", "shift": "A|B|OFF", "reason": "可选简短原因"}}
-  ]
+  "target": {{"start": "YYYY-MM-DD", "end": "YYYY-MM-DD"}},
+  "staffConstraints": [
+    {{
+      "person": "姓名",
+      "offDates": ["YYYY-MM-DD"],
+      "assignments": [{{"date": "YYYY-MM-DD", "shift": "A|B|OFF"}}],
+      "preferWeekendOff": false,
+      "maxConsecutiveWork": null
+    }}
+  ],
+  "global": {{
+    "maxConsecutiveWork": null,
+    "balanceWorkload": true,
+    "balanceShifts": true,
+    "avoidBA": true,
+    "preserveExisting": true
+  }}
 }}
 """
 
 
 @app.post("/api/ai/generate")
 def ai_generate():
-    if not DEEPSEEK_API_KEY:
-        return jsonify({"error": "服务器尚未配置 DeepSeek 密钥"}), 503
-    client = request.headers.get(
-        "X-Forwarded-For", request.remote_addr or "unknown"
-    ).split(",")[0].strip()
-    elapsed = time.time() - _ai_calls.get(client, 0)
-    if elapsed < AI_COOLDOWN_SECONDS:
-        return jsonify({"error": f"请等待 {int(AI_COOLDOWN_SECONDS - elapsed) + 1} 秒后再生成"}), 429
-
     payload = request.get_json(silent=True) or {}
     prompt = str(payload.get("prompt", "")).strip()
     if not prompt or len(prompt) > 1200:
@@ -876,15 +988,80 @@ def ai_generate():
         end = parse_date(str(payload.get("end", "")), "end")
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
-    start_date, end_date = date.fromisoformat(start), date.fromisoformat(end)
-    if end_date < start_date or (end_date - start_date).days > 62:
+    planning_start, planning_end = date.fromisoformat(start), date.fromisoformat(end)
+    if planning_end < planning_start or (planning_end - planning_start).days > 62:
         return jsonify({"error": "AI 单次排班范围应为 1-63 天"}), 400
+    scope_locked = bool(payload.get("scopeLocked"))
 
     staff_rows = db().execute(
         "SELECT id, name FROM staff WHERE active = 1 ORDER BY sort_order, id"
     ).fetchall()
-    staff_by_name = {row["name"]: row["id"] for row in staff_rows}
+    staff_items = [dict(row) for row in staff_rows]
+    staff_names = [row["name"] for row in staff_items]
+    if len(staff_items) < 2:
+        return jsonify({"error": "至少需要两位参与人员，才能生成 A 班和 B 班"}), 422
+
     rule_values = rules_payload(fetch_schedule_rules(schedule_id))
+    heuristic = heuristic_request(
+        prompt,
+        staff_names,
+        planning_start,
+        planning_end,
+        date.today(),
+        scope_locked,
+    )
+    parsed_result = None
+    parser_mode = "local"
+    client = request.headers.get(
+        "X-Forwarded-For", request.remote_addr or "unknown"
+    ).split(",")[0].strip()
+    elapsed = time.time() - _ai_calls.get(client, 0)
+    if DEEPSEEK_API_KEY and elapsed >= AI_COOLDOWN_SECONDS:
+        _ai_calls[client] = time.time()
+        try:
+            response = requests.post(
+                DEEPSEEK_API_URL,
+                headers={
+                    "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": DEEPSEEK_MODEL,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": ai_parser_prompt(staff_names, start, end, scope_locked),
+                        },
+                        {"role": "user", "content": prompt},
+                    ],
+                    "thinking": {"type": "disabled"},
+                    "response_format": {"type": "json_object"},
+                    "temperature": 0,
+                    "max_tokens": 2200,
+                    "stream": False,
+                },
+                timeout=45,
+            )
+            response.raise_for_status()
+            content = response.json()["choices"][0]["message"]["content"]
+            parsed_result = json.loads(content)
+            parser_mode = "ai"
+        except (requests.RequestException, KeyError, ValueError, json.JSONDecodeError) as exc:
+            app.logger.warning("DeepSeek rule parsing failed, using local parser: %s", exc)
+            parser_mode = "local-fallback"
+
+    request_config = merge_parsed_request(
+        parsed_result,
+        heuristic,
+        staff_names,
+        planning_start,
+        planning_end,
+        scope_locked,
+    )
+    target_start = date.fromisoformat(request_config["target"]["start"])
+    target_end = date.fromisoformat(request_config["target"]["end"])
+    start, end = target_start.isoformat(), target_end.isoformat()
+
     existing_rows = db().execute(
         """
         SELECT s.staff_id, s.shift_date, s.code, p.name
@@ -894,149 +1071,57 @@ def ai_generate():
         """,
         (schedule_id, start, end),
     ).fetchall()
-    current_schedule = [
-        {"date": row["shift_date"], "person": row["name"], "shift": row["code"]}
-        for row in existing_rows
-    ]
-    fixed_rule_instructions = []
-    if rule_values["exactDailyAB"]:
-        fixed_rule_instructions.append(
-            "每天必须且只能安排 1 人 A 班和 1 人 B 班，其余人员当天必须安排为 OFF。"
-        )
-    if rule_values["offTransition"]:
-        fixed_rule_instructions.append(
-            "每段连续休假前的最后一个工作日必须为 A 班，休假结束后的第一个工作日必须为 B 班。"
-        )
-    user_message = json.dumps(
-        {
-            "task": "请先遵守以下固定规则，再满足用户条件，并返回完整且可直接保存的排班。",
-            "today": date.today().isoformat(),
-            "conditions": prompt,
-            "fixed_rules": rule_values,
-            "fixed_rule_instructions": fixed_rule_instructions,
-            "current_schedule": current_schedule,
-        },
-        ensure_ascii=False,
-    )
-    _ai_calls[client] = time.time()
     try:
-        response = requests.post(
-            DEEPSEEK_API_URL,
-            headers={
-                "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": DEEPSEEK_MODEL,
-                "messages": [
-                    {
-                        "role": "system",
-                        "content": ai_system_prompt(
-                            list(staff_by_name), start, end, rule_values
-                        ),
-                    },
-                    {"role": "user", "content": user_message},
-                ],
-                "thinking": {"type": "disabled"},
-                "response_format": {"type": "json_object"},
-                "temperature": 0.2,
-                "max_tokens": 6000,
-                "stream": False,
-            },
-            timeout=80,
+        planned = build_schedule(
+            staff_items,
+            [dict(row) for row in existing_rows],
+            target_start,
+            target_end,
+            request_config,
+            rule_values,
         )
-        response.raise_for_status()
-        content = response.json()["choices"][0]["message"]["content"]
-        result = json.loads(content)
-    except (requests.RequestException, KeyError, ValueError, json.JSONDecodeError) as exc:
-        app.logger.exception("DeepSeek generation failed")
-        return jsonify(
-            {"error": "AI 暂时没有生成成功，请稍后重试", "detail": str(exc)[:180]}
-        ), 502
+    except ScheduleImpossible as exc:
+        return jsonify({"error": str(exc)}), 422
 
-    raw_schedule = result.get("schedule")
-    if not isinstance(raw_schedule, list):
-        return jsonify({"error": "AI 返回的数据格式不完整"}), 502
-
-    operations: dict[tuple[int, str], dict[str, Any]] = {}
-    rejected = 0
-    for item in raw_schedule[:500]:
-        if not isinstance(item, dict):
-            rejected += 1
-            continue
-        person = str(item.get("person", "")).strip()
-        shift = str(item.get("shift", "")).upper().strip()
-        try:
-            item_date = parse_date(str(item.get("date", "")))
-        except ValueError:
-            rejected += 1
-            continue
-        if (
-            person not in staff_by_name
-            or shift not in {"A", "B", "OFF"}
-            or not (start <= item_date <= end)
-        ):
-            rejected += 1
-            continue
-        staff_id = staff_by_name[person]
-        operations[(staff_id, item_date)] = {
-            "staff_id": staff_id,
-            "date": item_date,
-            "shift": shift,
-            "reason": str(item.get("reason", ""))[:200],
-        }
-
-    if not operations:
-        return jsonify({"error": "AI 没有返回可执行的班次，请换一种说法"}), 422
-
-    final_codes = {
+    existing_codes = {
         (row["staff_id"], row["shift_date"]): row["code"] for row in existing_rows
     }
-    final_codes.update(
-        {
-            key: operation["shift"]
-            for key, operation in operations.items()
-        }
-    )
-    staff_ids = [row["id"] for row in staff_rows]
+    operations = {
+        (operation["staff_id"], operation["date"]): operation
+        for operation in planned
+        if existing_codes.get((operation["staff_id"], operation["date"]))
+        != operation["shift"]
+    }
+
+    final_codes = {
+        (operation["staff_id"], operation["date"]): operation["shift"]
+        for operation in planned
+    }
+    staff_ids = [row["id"] for row in staff_items]
     range_dates = []
-    cursor_date = start_date
-    while cursor_date <= end_date:
+    cursor_date = target_start
+    while cursor_date <= target_end:
         range_dates.append(cursor_date.isoformat())
         cursor_date += timedelta(days=1)
 
-    if rule_values["exactDailyAB"]:
-        for item_date in range_dates:
-            day_codes = [final_codes.get((staff_id, item_date)) for staff_id in staff_ids]
-            if (
-                any(code not in ALLOWED_SHIFT_CODES for code in day_codes)
-                or day_codes.count("A") != 1
-                or day_codes.count("B") != 1
-            ):
-                return jsonify(
-                    {
-                        "error": "AI 没有满足设置中的「每天 1 个 A、1 个 B」规则，请重试"
-                    }
-                ), 422
+    for item_date in range_dates:
+        day_codes = [final_codes.get((staff_id, item_date)) for staff_id in staff_ids]
+        if (
+            any(code not in ALLOWED_SHIFT_CODES for code in day_codes)
+            or day_codes.count("A") != 1
+            or day_codes.count("B") != 1
+        ):
+            return jsonify({"error": "规则引擎未能生成完整班次，请调整条件"}), 500
 
     if rule_values["offTransition"]:
         for staff_id in staff_ids:
-            person_codes = [final_codes.get((staff_id, item_date)) for item_date in range_dates]
+            person_codes = [final_codes[(staff_id, item_date)] for item_date in range_dates]
             for index in range(1, len(person_codes)):
-                previous_code = person_codes[index - 1]
-                current_code = person_codes[index]
-                if current_code == "OFF" and previous_code in {"A", "B"} and previous_code != "A":
-                    return jsonify(
-                        {
-                            "error": "AI 没有满足设置中的「休假前 A、收假后 B」规则，请重试"
-                        }
-                    ), 422
-                if previous_code == "OFF" and current_code in {"A", "B"} and current_code != "B":
-                    return jsonify(
-                        {
-                            "error": "AI 没有满足设置中的「休假前 A、收假后 B」规则，请重试"
-                        }
-                    ), 422
+                previous_code, current_code = person_codes[index - 1], person_codes[index]
+                if current_code == "OFF" and previous_code != "OFF" and previous_code != "A":
+                    return jsonify({"error": "规则引擎未满足休假前 A 班规则"}), 500
+                if previous_code == "OFF" and current_code != "OFF" and current_code != "B":
+                    return jsonify({"error": "规则引擎未满足收假后 B 班规则"}), 500
 
     batch_id = uuid.uuid4().hex
     previous_state = []
@@ -1077,7 +1162,7 @@ def ai_generate():
                 now_iso(),
             ),
         )
-    summary = str(result.get("summary", "排班已经按条件生成"))[:240]
+    summary = str(request_config.get("summary", "排班已经按条件生成"))[:240]
     db().execute(
         """
         INSERT INTO ai_batches(
@@ -1102,7 +1187,9 @@ def ai_generate():
             "summary": summary,
             "changed": len(operations),
             "created": created_items,
-            "rejected": rejected,
+            "parser": parser_mode,
+            "target": request_config["target"],
+            "interpreted": request_config,
         }
     )
 
