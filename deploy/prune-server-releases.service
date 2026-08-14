@@ -1,0 +1,7 @@
+[Unit]
+Description=Prune old Mikeywa deployment releases
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/prune-mikeywa-releases
+
