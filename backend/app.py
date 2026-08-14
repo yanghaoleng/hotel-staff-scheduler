@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
 import sqlite3
@@ -16,6 +17,17 @@ from flask import Flask, g, jsonify, request, send_from_directory
 from flask_sock import Sock
 
 try:
+    from .doubao_asr import (
+        ASR_RESOURCE_ID,
+        ASR_URL,
+        MSG_ERROR,
+        MSG_FULL_SERVER_RESPONSE,
+        audio_request,
+        frame_payload,
+        full_client_request,
+        parse_server_frame,
+        transcript_from_payload,
+    )
     from .scheduler_engine import (
         ScheduleImpossible,
         build_schedule,
@@ -23,6 +35,17 @@ try:
         merge_parsed_request,
     )
 except ImportError:
+    from doubao_asr import (
+        ASR_RESOURCE_ID,
+        ASR_URL,
+        MSG_ERROR,
+        MSG_FULL_SERVER_RESPONSE,
+        audio_request,
+        frame_payload,
+        full_client_request,
+        parse_server_frame,
+        transcript_from_payload,
+    )
     from scheduler_engine import (
         ScheduleImpossible,
         build_schedule,
@@ -38,7 +61,6 @@ DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
 DEEPSEEK_MODEL = "deepseek-v4-flash"
 DOUBAO_ASR_API_KEY = os.environ.get("DOUBAO_ASR_API_KEY", "")
-DOUBAO_ASR_URL = "wss://ai-gateway.vei.volces.com/v1/realtime?model=bigmodel"
 ALLOWED_SHIFT_CODES = {"A", "B", "OFF"}
 AI_COOLDOWN_SECONDS = 12
 
@@ -483,28 +505,20 @@ def asr_stream(client):
             stopped.set()
 
     try:
+        request_id = str(uuid.uuid4())
         upstream = websocket_client.create_connection(
-            DOUBAO_ASR_URL,
-            header=[f"Authorization: Bearer {DOUBAO_ASR_API_KEY}"],
+            ASR_URL,
+            header=[
+                f"X-Api-Key: {DOUBAO_ASR_API_KEY}",
+                f"X-Api-Resource-Id: {ASR_RESOURCE_ID}",
+                f"X-Api-Request-Id: {request_id}",
+                "X-Api-Sequence: -1",
+                f"X-Api-Connect-Id: {uuid.uuid4()}",
+            ],
             timeout=12,
         )
-        upstream.send(
-            json.dumps(
-                {
-                    "type": "transcription_session.update",
-                    "session": {
-                        "input_audio_format": "pcm",
-                        "input_audio_codec": "raw",
-                        "input_audio_sample_rate": 16000,
-                        "input_audio_bits": 16,
-                        "input_audio_channel": 1,
-                        "result_type": 0,
-                        "input_audio_transcription": {"model": "bigmodel"},
-                        "turn_detection": None,
-                    },
-                }
-            )
-        )
+        upstream.send_binary(full_client_request())
+        send_client(json.dumps({"type": "transcription_session.updated"}))
 
         def receive_upstream() -> None:
             try:
@@ -512,15 +526,32 @@ def asr_stream(client):
                     message = upstream.recv()
                     if not message:
                         break
-                    send_client(message)
-                    try:
-                        event = json.loads(message)
-                    except (TypeError, json.JSONDecodeError):
+                    if not isinstance(message, bytes):
                         continue
-                    if event.get("type") == "conversation.item.input_audio_transcription.completed":
+                    frame = parse_server_frame(message)
+                    payload = frame_payload(frame)
+                    if frame.message_type == MSG_ERROR:
+                        error_text = str(payload.get("message") or payload.get("error") or frame.error_code)
+                        send_client(json.dumps({"type": "error", "message": f"语音识别失败：{error_text[:120]}"}, ensure_ascii=False))
                         completed.set()
                         break
-                    if event.get("type") == "error":
+                    if frame.message_type != MSG_FULL_SERVER_RESPONSE:
+                        continue
+                    code = payload.get("code", payload.get("status_code", 0))
+                    if code not in {None, 0, 1000, 20000000, "0", "1000", "20000000"}:
+                        error_text = str(payload.get("message") or payload.get("error") or code)
+                        send_client(json.dumps({"type": "error", "message": f"语音识别失败：{error_text[:120]}"}, ensure_ascii=False))
+                        completed.set()
+                        break
+                    transcript = transcript_from_payload(payload)
+                    event_type = (
+                        "conversation.item.input_audio_transcription.completed"
+                        if frame.final
+                        else "conversation.item.input_audio_transcription.result"
+                    )
+                    if transcript or frame.final:
+                        send_client(json.dumps({"type": event_type, "transcript": transcript}, ensure_ascii=False))
+                    if frame.final:
                         completed.set()
                         break
             except Exception as exc:
@@ -544,9 +575,13 @@ def asr_stream(client):
             if event_type == "audio":
                 audio = event.get("audio")
                 if isinstance(audio, str) and len(audio) <= 180000:
-                    upstream.send(json.dumps({"type": "input_audio_buffer.append", "audio": audio}))
+                    try:
+                        raw_audio = base64.b64decode(audio, validate=True)
+                    except (ValueError, TypeError):
+                        continue
+                    upstream.send_binary(audio_request(raw_audio))
             elif event_type == "commit":
-                upstream.send(json.dumps({"type": "input_audio_buffer.commit"}))
+                upstream.send_binary(audio_request(b"", final=True))
                 completed.wait(12)
                 break
             elif event_type == "cancel":
