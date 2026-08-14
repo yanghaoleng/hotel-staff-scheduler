@@ -30,9 +30,7 @@ import {
   CaretRight,
   ChartBar,
   Check,
-  ClockCountdown,
   CopySimple,
-  DotsSixVertical,
   Eye,
   EyeSlash,
   GearSix,
@@ -54,6 +52,7 @@ const SHIFT_META = {
 const WORK_SHIFT_CODES = new Set(["A", "B"]);
 const THEME_COLORS = { light: "#f4f1e8", dark: "#181713" };
 const STAFF_COLORS = ["#ef6a5b", "#4c7ee8", "#2f9b77", "#d69232", "#8b68c9", "#c85682"];
+const SHORTCUT_MODIFIER = navigator.userAgent.includes("Mac") ? "⌘" : "⌃";
 
 function api(path, options = {}) {
   return fetch(path, {
@@ -100,6 +99,7 @@ function ShiftCard({ shift, onEdit, ghost = false }) {
       layoutId={ghost ? undefined : `shift-${shift.id}`}
       type="button"
       className={`shift-card ${shift.code === "OFF" ? "is-off" : ""} ${isDragging ? "is-dragging" : ""} ${ghost ? "is-ghost" : ""}`}
+      aria-label={`${SHIFT_META[shift.code]?.name || shift.code} ${shift.person}`}
       style={style}
       onClick={(event) => {
         event.stopPropagation();
@@ -111,9 +111,8 @@ function ShiftCard({ shift, onEdit, ghost = false }) {
       {...listeners}
       {...attributes}
     >
-      <span className="shift-grip"><DotsSixVertical size={12} weight="bold" /></span>
-      <span className="shift-code">{SHIFT_META[shift.code]?.label || shift.code}</span>
-      <span className="shift-name">{shift.person}</span>
+      <span className="shift-name shift-name-full">{shift.person}</span>
+      <span className="shift-name shift-name-short" aria-hidden="true">{shift.person.slice(0, 1)}</span>
     </motion.button>
   );
 }
@@ -146,6 +145,7 @@ function DayCell({ day, currentMonth, shifts, onAdd, onEdit, selected, onSelectS
   const today = isSameDay(day, new Date());
   return (
     <div
+      data-date={iso}
       className={`day-cell ${!isSameMonth(day, currentMonth) ? "is-outside" : ""} ${today ? "is-today" : ""} ${selected ? "is-selected" : ""}`}
       onPointerDown={(event) => {
         if (event.pointerType === "touch" || event.button !== 0 || event.target.closest("button, .shift-card")) return;
@@ -179,33 +179,19 @@ function DayCell({ day, currentMonth, shifts, onAdd, onEdit, selected, onSelectS
   );
 }
 
-function MonthlyStats({ metrics, people }) {
-  const totals = [
-    ["A 班", metrics.early],
-    ["B 班", metrics.late],
-    ["排班", metrics.work],
-    ["休假", metrics.off],
-  ];
+function MonthlyStats({ people }) {
   return (
     <section className="stats-board" aria-label="本月排班统计">
-      <header>
-        <div><strong>本月统计</strong><span>按当前 Sheet 计算</span></div>
-      </header>
-      <div className="stats-content">
-        <div className="stats-totals">
-          {totals.map(([label, value]) => <div key={label}><strong>{value}</strong><span>{label}</span></div>)}
+      <div className="people-stats" role="table" aria-label="每人本月统计">
+        <div className="people-stats-row is-head" role="row">
+          <span role="columnheader">人员</span><span role="columnheader">A</span><span role="columnheader">B</span><span role="columnheader">排班</span><span role="columnheader">休假</span>
         </div>
-        <div className="people-stats" role="table" aria-label="每人本月统计">
-          <div className="people-stats-row is-head" role="row">
-            <span role="columnheader">人员</span><span role="columnheader">A</span><span role="columnheader">B</span><span role="columnheader">排班</span><span role="columnheader">休假</span>
+        {people.map((person) => (
+          <div className="people-stats-row" role="row" key={person.id}>
+            <span role="cell"><i style={{ background: person.color }} />{person.name}</span>
+            <span role="cell">{person.early}</span><span role="cell">{person.late}</span><strong role="cell">{person.work}</strong><span role="cell">{person.off}</span>
           </div>
-          {people.map((person) => (
-            <div className="people-stats-row" role="row" key={person.id}>
-              <span role="cell"><i style={{ background: person.color }} />{person.name}</span>
-              <span role="cell">{person.early}</span><span role="cell">{person.late}</span><strong role="cell">{person.work}</strong><span role="cell">{person.off}</span>
-            </div>
-          ))}
-        </div>
+        ))}
       </div>
     </section>
   );
@@ -481,7 +467,6 @@ function Scheduler() {
   const [aiBusy, setAiBusy] = useState(false);
   const [activeBatch, setActiveBatch] = useState(null);
   const [toasts, setToasts] = useState([]);
-  const [sidebarOpen, setSidebarOpen] = useState(false);
   const [statsOpen, setStatsOpen] = useState(false);
   const [hiddenStaffIds, setHiddenStaffIds] = useState(() => new Set());
   const [selectionAnchor, setSelectionAnchor] = useState(null);
@@ -489,6 +474,7 @@ function Scheduler() {
   const [selectionDragging, setSelectionDragging] = useState(false);
   const longPressTimer = useRef(null);
   const statsRef = useRef(null);
+  const clearUndoRef = useRef(null);
   const reduceMotion = useReducedMotion();
 
   const gridStart = useMemo(() => startOfWeek(startOfMonth(month), { weekStartsOn: 1 }), [month]);
@@ -515,10 +501,11 @@ function Scheduler() {
     useSensor(TouchSensor, { activationConstraint: { delay: 180, tolerance: 6 } }),
   );
 
-  function toast(message, type = "success", action = null) {
+  function toast(message, type = "success", action = null, duration = action ? 10000 : 4200) {
     const id = crypto.randomUUID();
     setToasts((current) => [...current.slice(-3), { id, message, type, action }]);
-    window.setTimeout(() => setToasts((current) => current.filter((item) => item.id !== id)), action ? 9000 : 4200);
+    window.setTimeout(() => setToasts((current) => current.filter((item) => item.id !== id)), duration);
+    return id;
   }
 
   function dismissToast(id) {
@@ -599,6 +586,20 @@ function Scheduler() {
     setSelectionDragging(false);
   }, [activeScheduleId, month]);
 
+  useEffect(() => {
+    if (!selectedDates.length) return undefined;
+    const cancelSelection = (event) => {
+      const target = event.target;
+      if (!(target instanceof Element)) return;
+      const keepsSelection = target.closest(
+        ".day-cell, .selection-toolbar, button, input, textarea, select, a, [contenteditable='true'], .modal-card",
+      );
+      if (!keepsSelection) clearDateSelection();
+    };
+    document.addEventListener("pointerdown", cancelSelection);
+    return () => document.removeEventListener("pointerdown", cancelSelection);
+  }, [selectedDates.length]);
+
   const shiftsByDay = useMemo(() => {
     const grouped = new Map();
     shifts.forEach((shift) => {
@@ -614,12 +615,6 @@ function Scheduler() {
     () => shifts.filter((shift) => isSameMonth(parseISO(shift.date), month)),
     [shifts, month],
   );
-  const metrics = useMemo(() => ({
-    early: monthShifts.filter((item) => item.code === "A").length,
-    late: monthShifts.filter((item) => item.code === "B").length,
-    work: monthShifts.filter((item) => WORK_SHIFT_CODES.has(item.code)).length,
-    off: monthShifts.filter((item) => item.code === "OFF").length,
-  }), [monthShifts]);
   const peopleStats = useMemo(() => staff.map((person) => {
     const personShifts = monthShifts.filter((item) => item.staffId === person.id);
     const early = personShifts.filter((item) => item.code === "A").length;
@@ -651,8 +646,6 @@ function Scheduler() {
 
   function showOnlyStaff(staffId) {
     setHiddenStaffIds(new Set(staff.filter((person) => person.id !== staffId).map((person) => person.id)));
-    const person = staff.find((item) => item.id === staffId);
-    if (person) toast(`日历现在只显示 ${person.name}`);
   }
 
   function startStaffLongPress(staffId) {
@@ -701,22 +694,45 @@ function Scheduler() {
 
   useEffect(() => {
     if (!selectedDates.length) return undefined;
-    const copyWithShortcut = (event) => {
+    const handleSelectionShortcut = (event) => {
       const target = event.target;
       const isEditing = target instanceof HTMLElement
         && (target.matches("input, textarea, [contenteditable='true']") || target.isContentEditable);
-      if (isEditing || event.key.toLowerCase() !== "c" || (!event.metaKey && !event.ctrlKey)) return;
-      event.preventDefault();
-      copySelectionForExcel();
+      if (isEditing) return;
+      if (event.key === "Escape") {
+        clearDateSelection();
+        return;
+      }
+      if (event.key.toLowerCase() === "c" && (event.metaKey || event.ctrlKey)) {
+        event.preventDefault();
+        copySelectionForExcel();
+      }
+      if (!event.metaKey && !event.ctrlKey && ["Delete", "Backspace"].includes(event.key)) {
+        event.preventDefault();
+        if (!busy) clearSelectedDates();
+      }
     };
-    window.addEventListener("keydown", copyWithShortcut);
-    return () => window.removeEventListener("keydown", copyWithShortcut);
-  }, [selectedDates, shifts, staff]);
+    window.addEventListener("keydown", handleSelectionShortcut);
+    return () => window.removeEventListener("keydown", handleSelectionShortcut);
+  }, [busy, selectedDates, shifts, staff]);
+
+  useEffect(() => {
+    const undoWithShortcut = (event) => {
+      const target = event.target;
+      const isEditing = target instanceof HTMLElement
+        && (target.matches("input, textarea, [contenteditable='true']") || target.isContentEditable);
+      if (isEditing || event.key.toLowerCase() !== "z" || (!event.metaKey && !event.ctrlKey)) return;
+      const entry = clearUndoRef.current;
+      if (!entry || Date.now() > entry.expiresAt) return;
+      event.preventDefault();
+      undoClearedShifts(entry);
+    };
+    window.addEventListener("keydown", undoWithShortcut);
+    return () => window.removeEventListener("keydown", undoWithShortcut);
+  }, [activeScheduleId, staff]);
 
   async function clearSelectedDates() {
     if (!selectedDates.length) return;
-    const confirmed = window.confirm(`确定清空所选 ${selectedDates.length} 天的全部排班和休假吗？`);
-    if (!confirmed) return;
     setBusy(true);
     try {
       const result = await api("/api/shifts/bulk-delete", {
@@ -726,8 +742,57 @@ function Scheduler() {
       setShifts((current) => current.filter((shift) => !selectedDateSet.has(shift.date)));
       adjustActiveScheduleCount(-result.workDeleted);
       clearDateSelection();
-      toast(`已清空 ${result.deleted} 条记录`);
+      if (!result.deleted) {
+        toast("所选日期没有可清空的排班");
+        return;
+      }
+      if (clearUndoRef.current?.toastId) dismissToast(clearUndoRef.current.toastId);
+      const undoEntry = {
+        scheduleId: activeScheduleId,
+        shifts: result.undo,
+        expiresAt: Date.now() + 10000,
+        toastId: null,
+      };
+      clearUndoRef.current = undoEntry;
+      undoEntry.toastId = toast(`已清空 ${result.deleted} 条记录`, "success", {
+        label: `撤销 ${SHORTCUT_MODIFIER} Z`,
+        onClick: () => undoClearedShifts(undoEntry),
+      }, 10000);
+      window.setTimeout(() => {
+        if (clearUndoRef.current === undoEntry) clearUndoRef.current = null;
+      }, 10050);
     } catch (error) {
+      toast(error.message, "error");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function undoClearedShifts(entry = clearUndoRef.current) {
+    if (!entry || entry !== clearUndoRef.current || entry.restoring || Date.now() > entry.expiresAt) return;
+    entry.restoring = true;
+    setBusy(true);
+    try {
+      const result = await api("/api/shifts/bulk-restore", {
+        method: "POST",
+        body: JSON.stringify({ scheduleId: entry.scheduleId, shifts: entry.shifts }),
+      });
+      clearUndoRef.current = null;
+      if (entry.toastId) dismissToast(entry.toastId);
+      if (entry.scheduleId === activeScheduleId) {
+        const visibleStaffIds = new Set(staff.map((person) => person.id));
+        setShifts((current) => {
+          const byId = new Map(current.map((shift) => [shift.id, shift]));
+          result.shifts
+            .filter((shift) => visibleStaffIds.has(shift.staffId))
+            .forEach((shift) => byId.set(shift.id, shift));
+          return [...byId.values()];
+        });
+        adjustActiveScheduleCount(result.workRestored);
+      }
+      toast(`已恢复 ${result.restored} 条排班`);
+    } catch (error) {
+      entry.restoring = false;
       toast(error.message, "error");
     } finally {
       setBusy(false);
@@ -750,7 +815,6 @@ function Scheduler() {
         Number(WORK_SHIFT_CODES.has(result.shift.code)) - Number(WORK_SHIFT_CODES.has(previous?.code)),
       );
       setEditor(null);
-      toast(editing ? "班次已更新" : "班次已添加");
     } catch (error) {
       toast(error.message, "error");
     } finally {
@@ -786,10 +850,6 @@ function Scheduler() {
       adjustActiveScheduleCount(
         Number(WORK_SHIFT_CODES.has(codeValue)) - Number(WORK_SHIFT_CODES.has(original.code)),
       );
-      const destination = shift.date === dateValue
-        ? SHIFT_META[codeValue].name
-        : `${format(parseISO(dateValue), "M月d日")} · ${SHIFT_META[codeValue].name}`;
-      toast(`${shift.person} 已调整到 ${destination}`);
     } catch (error) {
       setShifts((current) => current.map((item) => item.id === shift.id ? { ...item, ...original } : item));
       toast(error.message, "error");
@@ -833,9 +893,8 @@ function Scheduler() {
   async function addStaff(value) {
     setBusy(true);
     try {
-      const result = await api("/api/staff", { method: "POST", body: JSON.stringify(value) });
+      await api("/api/staff", { method: "POST", body: JSON.stringify(value) });
       await loadData({ quiet: true });
-      toast(result.restored ? `${value.name} 已恢复到排班` : `${value.name} 已加入排班`);
     } catch (error) {
       toast(error.message, "error");
       throw error;
@@ -863,7 +922,6 @@ function Scheduler() {
         body: JSON.stringify(values),
       });
       setRules(result.rules);
-      toast("固定排班规则已更新");
     } catch (error) {
       toast(error.message, "error");
     } finally {
@@ -888,7 +946,6 @@ function Scheduler() {
         setActiveScheduleId(result.schedule.id);
         localStorage.setItem("plan-sheet", String(result.schedule.id));
       }
-      toast(editing ? "Sheet 已改名" : `已创建「${result.schedule.name}」`);
     } catch (error) {
       toast(error.message, "error");
     } finally {
@@ -921,8 +978,6 @@ function Scheduler() {
     setActiveScheduleId(scheduleId);
     localStorage.setItem("plan-sheet", String(scheduleId));
   }
-
-  const activeSchedule = schedules.find((item) => item.id === activeScheduleId);
 
   return (
     <DndContext
@@ -962,12 +1017,10 @@ function Scheduler() {
               <Plus size={14} weight="bold" /> 新建 Sheet
             </button>
           </div>
-          <span className="public-sync"><i /> 公开协作 · 自动同步</span>
-          <button className="tiny-icon mobile-only sheetbar-panel-toggle" type="button" onClick={() => setSidebarOpen((value) => !value)} aria-label="排班设置"><GearSix size={17} /></button>
         </nav>
 
         <div className="workspace">
-          <aside className={`sidebar ${sidebarOpen ? "is-open" : ""}`}>
+          <aside className="sidebar">
             <div className="sidebar-scroll">
               <section className="ai-panel">
                 <textarea
@@ -1034,7 +1087,6 @@ function Scheduler() {
                 <button className="icon-button" type="button" onClick={() => setMonth((value) => subMonths(value, 1))} aria-label="上个月"><CaretLeft size={18} /></button>
                 <div>
                   <h1>{format(month, "yyyy年 M月")}</h1>
-                  <p>{activeSchedule?.name || "排班表"} · {staff.length} 人参与</p>
                 </div>
                 <button className="icon-button" type="button" onClick={() => setMonth((value) => addMonths(value, 1))} aria-label="下个月"><CaretRight size={18} /></button>
               </div>
@@ -1046,7 +1098,7 @@ function Scheduler() {
                   aria-expanded={statsOpen}
                   aria-haspopup="dialog"
                 >
-                  <ChartBar size={15} /><span>本月统计</span><strong>{metrics.work}</strong>
+                  <ChartBar size={15} /><span>本月统计</span>
                 </button>
                 <button className="secondary-button compact today-button" type="button" onClick={() => setMonth(startOfMonth(new Date()))}>今天</button>
                 <AnimatePresence>
@@ -1060,7 +1112,7 @@ function Scheduler() {
                       role="dialog"
                       aria-label="本月统计详情"
                     >
-                      <MonthlyStats metrics={metrics} people={peopleStats} />
+                      <MonthlyStats people={peopleStats} />
                     </motion.div>
                   )}
                 </AnimatePresence>
@@ -1095,7 +1147,6 @@ function Scheduler() {
                 </div>
               )}
             </section>
-            <p className="calendar-tip"><ClockCountdown size={14} /> 把人员色块拖到同一天或其他日期的 A、B、休假栏；双击空栏可以快速添加。</p>
           </main>
         </div>
       </div>
@@ -1118,9 +1169,9 @@ function Scheduler() {
             <i />
             <button type="button" onClick={copySelectionForExcel}>
               <CopySimple size={16} /> 复制到 Excel
-              <kbd>{navigator.userAgent.includes("Mac") ? "⌘ C" : "Ctrl C"}</kbd>
+              <kbd>{SHORTCUT_MODIFIER} C</kbd>
             </button>
-            <button className="is-danger" type="button" onClick={clearSelectedDates} disabled={busy}><Trash size={16} /> 清空</button>
+            <button className="is-danger" type="button" onClick={clearSelectedDates} disabled={busy}><Trash size={16} /> 清空 <kbd>Delete</kbd></button>
             <button className="selection-close" type="button" onClick={clearDateSelection} aria-label="取消选择"><X size={16} /></button>
           </motion.div>
         )}
@@ -1163,7 +1214,6 @@ function Scheduler() {
         )}
       </AnimatePresence>
       <Toasts toasts={toasts} dismiss={dismissToast} />
-      {sidebarOpen && <button className="mobile-scrim" type="button" aria-label="关闭面板" onClick={() => setSidebarOpen(false)} />}
     </DndContext>
   );
 }
