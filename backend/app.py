@@ -232,6 +232,8 @@ def init_database() -> None:
             if person not in staff_ids:
                 continue
             for day, code in days.items():
+                if code != "OFF":
+                    continue
                 rows.append(
                     (
                         default_schedule_id,
