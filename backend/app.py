@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-import hmac
 import json
 import os
 import sqlite3
 import time
 import uuid
-from datetime import date, datetime, timedelta
-from functools import wraps
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -18,7 +16,6 @@ from flask import Flask, g, jsonify, request, send_from_directory
 BASE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = BASE_DIR / "static"
 DATABASE_PATH = Path(os.environ.get("PLAN_DATABASE_PATH", BASE_DIR / "data" / "plan.db"))
-ACCESS_CODE = os.environ.get("PLAN_ACCESS_CODE", "dev-plan")
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
 DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
 DEEPSEEK_MODEL = "deepseek-v4-flash"
@@ -53,6 +50,31 @@ def close_db(_: BaseException | None) -> None:
         connection.close()
 
 
+def table_columns(connection: sqlite3.Connection, table: str) -> set[str]:
+    return {row["name"] for row in connection.execute(f"PRAGMA table_info({table})")}
+
+
+def create_shifts_table(connection: sqlite3.Connection) -> None:
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS shifts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            schedule_id INTEGER NOT NULL REFERENCES schedules(id) ON DELETE CASCADE,
+            staff_id INTEGER NOT NULL REFERENCES staff(id) ON DELETE CASCADE,
+            shift_date TEXT NOT NULL,
+            code TEXT NOT NULL CHECK(code IN ('A', 'B', 'E')),
+            note TEXT NOT NULL DEFAULT '',
+            source TEXT NOT NULL DEFAULT 'manual',
+            batch_id TEXT,
+            updated_at TEXT NOT NULL,
+            UNIQUE(schedule_id, staff_id, shift_date)
+        );
+        CREATE INDEX IF NOT EXISTS idx_shifts_schedule_date
+            ON shifts(schedule_id, shift_date);
+        """
+    )
+
+
 def init_database() -> None:
     DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(DATABASE_PATH)
@@ -69,22 +91,17 @@ def init_database() -> None:
             created_at TEXT NOT NULL
         );
 
-        CREATE TABLE IF NOT EXISTS shifts (
+        CREATE TABLE IF NOT EXISTS schedules (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            staff_id INTEGER NOT NULL REFERENCES staff(id) ON DELETE CASCADE,
-            shift_date TEXT NOT NULL,
-            code TEXT NOT NULL CHECK(code IN ('A', 'B', 'E')),
-            note TEXT NOT NULL DEFAULT '',
-            source TEXT NOT NULL DEFAULT 'manual',
-            batch_id TEXT,
-            updated_at TEXT NOT NULL,
-            UNIQUE(staff_id, shift_date)
+            name TEXT NOT NULL UNIQUE,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
         );
-
-        CREATE INDEX IF NOT EXISTS idx_shifts_date ON shifts(shift_date);
 
         CREATE TABLE IF NOT EXISTS ai_batches (
             id TEXT PRIMARY KEY,
+            schedule_id INTEGER,
             prompt TEXT NOT NULL,
             summary TEXT NOT NULL,
             previous_state TEXT NOT NULL,
@@ -93,6 +110,49 @@ def init_database() -> None:
         );
         """
     )
+
+    schedule_count = connection.execute("SELECT COUNT(*) FROM schedules").fetchone()[0]
+    if schedule_count == 0:
+        stamp = now_iso()
+        connection.execute(
+            "INSERT INTO schedules(name, sort_order, created_at, updated_at) VALUES (?, 0, ?, ?)",
+            ("Jennie 8月排班", stamp, stamp),
+        )
+    default_schedule_id = connection.execute(
+        "SELECT id FROM schedules ORDER BY sort_order, id LIMIT 1"
+    ).fetchone()[0]
+
+    shifts_exists = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'shifts'"
+    ).fetchone()
+    if shifts_exists and "schedule_id" not in table_columns(connection, "shifts"):
+        connection.execute("PRAGMA foreign_keys = OFF")
+        connection.execute("ALTER TABLE shifts RENAME TO shifts_legacy")
+        connection.execute("DROP INDEX IF EXISTS idx_shifts_date")
+        create_shifts_table(connection)
+        connection.execute(
+            """
+            INSERT INTO shifts(
+                id, schedule_id, staff_id, shift_date, code, note,
+                source, batch_id, updated_at
+            )
+            SELECT id, ?, staff_id, shift_date, code, note,
+                   source, batch_id, updated_at
+            FROM shifts_legacy
+            """,
+            (default_schedule_id,),
+        )
+        connection.execute("DROP TABLE shifts_legacy")
+        connection.execute("PRAGMA foreign_keys = ON")
+    else:
+        create_shifts_table(connection)
+
+    if "schedule_id" not in table_columns(connection, "ai_batches"):
+        connection.execute("ALTER TABLE ai_batches ADD COLUMN schedule_id INTEGER")
+        connection.execute(
+            "UPDATE ai_batches SET schedule_id = ? WHERE schedule_id IS NULL",
+            (default_schedule_id,),
+        )
 
     staff_count = connection.execute("SELECT COUNT(*) FROM staff").fetchone()[0]
     if staff_count == 0:
@@ -121,6 +181,7 @@ def init_database() -> None:
             for day, code in days.items():
                 rows.append(
                     (
+                        default_schedule_id,
                         staff_ids[person],
                         f"2026-08-{day:02d}",
                         code,
@@ -131,8 +192,9 @@ def init_database() -> None:
                 )
         connection.executemany(
             """
-            INSERT INTO shifts(staff_id, shift_date, code, note, source, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO shifts(
+                schedule_id, staff_id, shift_date, code, note, source, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             rows,
         )
@@ -140,22 +202,25 @@ def init_database() -> None:
     connection.close()
 
 
-def require_access(view):
-    @wraps(view)
-    def wrapped(*args, **kwargs):
-        supplied = request.headers.get("X-Plan-Access", "")
-        if not ACCESS_CODE or not hmac.compare_digest(supplied, ACCESS_CODE):
-            return jsonify({"error": "需要访问口令"}), 401
-        return view(*args, **kwargs)
-
-    return wrapped
-
-
 def parse_date(value: str | None, field: str = "date") -> str:
     try:
         return date.fromisoformat(value or "").isoformat()
     except ValueError as exc:
         raise ValueError(f"{field} 必须是 YYYY-MM-DD") from exc
+
+
+def parse_schedule_id(value: Any) -> int:
+    try:
+        schedule_id = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("请选择有效的排班表") from exc
+    if db().execute("SELECT id FROM schedules WHERE id = ?", (schedule_id,)).fetchone() is None:
+        raise ValueError("这张排班表已被删除")
+    return schedule_id
+
+
+def touch_schedule(schedule_id: int) -> None:
+    db().execute("UPDATE schedules SET updated_at = ? WHERE id = ?", (now_iso(), schedule_id))
 
 
 def staff_payload(row: sqlite3.Row) -> dict[str, Any]:
@@ -168,9 +233,20 @@ def staff_payload(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
+def schedule_payload(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "sortOrder": row["sort_order"],
+        "updatedAt": row["updated_at"],
+        "shiftCount": row["shift_count"] if "shift_count" in row.keys() else 0,
+    }
+
+
 def shift_payload(row: sqlite3.Row) -> dict[str, Any]:
     return {
         "id": row["id"],
+        "scheduleId": row["schedule_id"],
         "staffId": row["staff_id"],
         "person": row["person"],
         "color": row["color"],
@@ -193,6 +269,17 @@ def fetch_shift(shift_id: int) -> sqlite3.Row | None:
     ).fetchone()
 
 
+def fetch_schedules() -> list[sqlite3.Row]:
+    return db().execute(
+        """
+        SELECT sc.*, COUNT(s.id) AS shift_count
+        FROM schedules sc LEFT JOIN shifts s ON s.schedule_id = sc.id
+        GROUP BY sc.id
+        ORDER BY sc.sort_order, sc.id
+        """
+    ).fetchall()
+
+
 @app.get("/api/health")
 def health():
     return jsonify(
@@ -201,20 +288,12 @@ def health():
             "service": "hotel-staff-scheduler",
             "aiConfigured": bool(DEEPSEEK_API_KEY),
             "model": DEEPSEEK_MODEL,
+            "access": "public",
         }
     )
 
 
-@app.post("/api/session")
-def session():
-    supplied = (request.get_json(silent=True) or {}).get("code", "")
-    if not ACCESS_CODE or not hmac.compare_digest(str(supplied), ACCESS_CODE):
-        return jsonify({"error": "访问口令不正确"}), 401
-    return jsonify({"ok": True})
-
-
 @app.get("/api/bootstrap")
-@require_access
 def bootstrap():
     try:
         start = parse_date(request.args.get("start"), "start")
@@ -224,6 +303,18 @@ def bootstrap():
     if start > end:
         return jsonify({"error": "开始日期不能晚于结束日期"}), 400
 
+    schedules = fetch_schedules()
+    requested_id = request.args.get("scheduleId")
+    active = None
+    if requested_id:
+        try:
+            active_id = int(requested_id)
+            active = next((row for row in schedules if row["id"] == active_id), None)
+        except ValueError:
+            active = None
+    if active is None:
+        active = schedules[0]
+
     staff = db().execute(
         "SELECT * FROM staff WHERE active = 1 ORDER BY sort_order, id"
     ).fetchall()
@@ -231,13 +322,15 @@ def bootstrap():
         """
         SELECT s.*, p.name AS person, p.color
         FROM shifts s JOIN staff p ON p.id = s.staff_id
-        WHERE s.shift_date BETWEEN ? AND ? AND p.active = 1
+        WHERE s.schedule_id = ? AND s.shift_date BETWEEN ? AND ? AND p.active = 1
         ORDER BY s.shift_date, p.sort_order, s.id
         """,
-        (start, end),
+        (active["id"], start, end),
     ).fetchall()
     return jsonify(
         {
+            "schedules": [schedule_payload(row) for row in schedules],
+            "activeSchedule": schedule_payload(active),
             "staff": [staff_payload(row) for row in staff],
             "shifts": [shift_payload(row) for row in shifts],
             "ai": {"configured": bool(DEEPSEEK_API_KEY), "model": DEEPSEEK_MODEL},
@@ -245,8 +338,75 @@ def bootstrap():
     )
 
 
+@app.post("/api/schedules")
+def add_schedule():
+    payload = request.get_json(silent=True) or {}
+    name = str(payload.get("name", "")).strip()
+    if not name or len(name) > 32:
+        return jsonify({"error": "表名长度应为 1-32 个字符"}), 400
+    try:
+        next_order = db().execute(
+            "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM schedules"
+        ).fetchone()[0]
+        stamp = now_iso()
+        cursor = db().execute(
+            "INSERT INTO schedules(name, sort_order, created_at, updated_at) VALUES (?, ?, ?, ?)",
+            (name, next_order, stamp, stamp),
+        )
+        db().commit()
+    except sqlite3.IntegrityError:
+        return jsonify({"error": "已经有同名排班表"}), 409
+    row = db().execute(
+        "SELECT *, 0 AS shift_count FROM schedules WHERE id = ?", (cursor.lastrowid,)
+    ).fetchone()
+    return jsonify({"schedule": schedule_payload(row)}), 201
+
+
+@app.patch("/api/schedules/<int:schedule_id>")
+def edit_schedule(schedule_id: int):
+    row = db().execute("SELECT * FROM schedules WHERE id = ?", (schedule_id,)).fetchone()
+    if row is None:
+        return jsonify({"error": "这张排班表已被删除"}), 404
+    payload = request.get_json(silent=True) or {}
+    name = str(payload.get("name", row["name"])).strip()
+    if not name or len(name) > 32:
+        return jsonify({"error": "表名长度应为 1-32 个字符"}), 400
+    try:
+        db().execute(
+            "UPDATE schedules SET name = ?, updated_at = ? WHERE id = ?",
+            (name, now_iso(), schedule_id),
+        )
+        db().commit()
+    except sqlite3.IntegrityError:
+        return jsonify({"error": "已经有同名排班表"}), 409
+    updated = db().execute(
+        """
+        SELECT sc.*, COUNT(s.id) AS shift_count
+        FROM schedules sc LEFT JOIN shifts s ON s.schedule_id = sc.id
+        WHERE sc.id = ? GROUP BY sc.id
+        """,
+        (schedule_id,),
+    ).fetchone()
+    return jsonify({"schedule": schedule_payload(updated)})
+
+
+@app.delete("/api/schedules/<int:schedule_id>")
+def delete_schedule(schedule_id: int):
+    count = db().execute("SELECT COUNT(*) FROM schedules").fetchone()[0]
+    if count <= 1:
+        return jsonify({"error": "至少保留一张排班表"}), 409
+    if db().execute("SELECT id FROM schedules WHERE id = ?", (schedule_id,)).fetchone() is None:
+        return jsonify({"error": "这张排班表已被删除"}), 404
+    db().execute("DELETE FROM ai_batches WHERE schedule_id = ?", (schedule_id,))
+    db().execute("DELETE FROM schedules WHERE id = ?", (schedule_id,))
+    db().commit()
+    next_row = db().execute(
+        "SELECT id FROM schedules ORDER BY sort_order, id LIMIT 1"
+    ).fetchone()
+    return jsonify({"ok": True, "nextScheduleId": next_row["id"]})
+
+
 @app.post("/api/staff")
-@require_access
 def add_staff():
     payload = request.get_json(silent=True) or {}
     name = str(payload.get("name", "")).strip()
@@ -256,7 +416,9 @@ def add_staff():
     if not color.startswith("#") or len(color) != 7:
         return jsonify({"error": "颜色格式不正确"}), 400
     try:
-        next_order = db().execute("SELECT COALESCE(MAX(sort_order), -1) + 1 FROM staff").fetchone()[0]
+        next_order = db().execute(
+            "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM staff"
+        ).fetchone()[0]
         cursor = db().execute(
             "INSERT INTO staff(name, color, sort_order, created_at) VALUES (?, ?, ?, ?)",
             (name, color, next_order, now_iso()),
@@ -269,7 +431,6 @@ def add_staff():
 
 
 @app.patch("/api/staff/<int:staff_id>")
-@require_access
 def edit_staff(staff_id: int):
     payload = request.get_json(silent=True) or {}
     row = db().execute("SELECT * FROM staff WHERE id = ?", (staff_id,)).fetchone()
@@ -293,10 +454,10 @@ def edit_staff(staff_id: int):
 
 
 @app.post("/api/shifts")
-@require_access
 def add_shift():
     payload = request.get_json(silent=True) or {}
     try:
+        schedule_id = parse_schedule_id(payload.get("scheduleId"))
         shift_date = parse_date(str(payload.get("date", "")))
         staff_id = int(payload.get("staffId"))
     except (ValueError, TypeError) as exc:
@@ -305,16 +466,20 @@ def add_shift():
     note = str(payload.get("note", "")).strip()[:200]
     if code not in ALLOWED_SHIFT_CODES:
         return jsonify({"error": "班次只支持 A、B 或 E"}), 400
-    if db().execute("SELECT id FROM staff WHERE id = ? AND active = 1", (staff_id,)).fetchone() is None:
+    if db().execute(
+        "SELECT id FROM staff WHERE id = ? AND active = 1", (staff_id,)
+    ).fetchone() is None:
         return jsonify({"error": "未找到员工"}), 404
     try:
         cursor = db().execute(
             """
-            INSERT INTO shifts(staff_id, shift_date, code, note, source, updated_at)
-            VALUES (?, ?, ?, ?, 'manual', ?)
+            INSERT INTO shifts(
+                schedule_id, staff_id, shift_date, code, note, source, updated_at
+            ) VALUES (?, ?, ?, ?, ?, 'manual', ?)
             """,
-            (staff_id, shift_date, code, note, now_iso()),
+            (schedule_id, staff_id, shift_date, code, note, now_iso()),
         )
+        touch_schedule(schedule_id)
         db().commit()
     except sqlite3.IntegrityError:
         return jsonify({"error": "该员工当天已经有班次"}), 409
@@ -322,7 +487,6 @@ def add_shift():
 
 
 @app.patch("/api/shifts/<int:shift_id>")
-@require_access
 def edit_shift(shift_id: int):
     existing = fetch_shift(shift_id)
     if existing is None:
@@ -345,6 +509,7 @@ def edit_shift(shift_id: int):
             """,
             (staff_id, shift_date, code, note, now_iso(), shift_id),
         )
+        touch_schedule(existing["schedule_id"])
         db().commit()
     except sqlite3.IntegrityError:
         return jsonify({"error": "该员工目标日期已经有班次"}), 409
@@ -352,12 +517,13 @@ def edit_shift(shift_id: int):
 
 
 @app.delete("/api/shifts/<int:shift_id>")
-@require_access
 def delete_shift(shift_id: int):
-    cursor = db().execute("DELETE FROM shifts WHERE id = ?", (shift_id,))
-    db().commit()
-    if cursor.rowcount == 0:
+    existing = fetch_shift(shift_id)
+    if existing is None:
         return jsonify({"error": "未找到班次"}), 404
+    db().execute("DELETE FROM shifts WHERE id = ?", (shift_id,))
+    touch_schedule(existing["schedule_id"])
+    db().commit()
     return jsonify({"ok": True})
 
 
@@ -386,11 +552,12 @@ def ai_system_prompt(staff_names: list[str], start: str, end: str) -> str:
 
 
 @app.post("/api/ai/generate")
-@require_access
 def ai_generate():
     if not DEEPSEEK_API_KEY:
         return jsonify({"error": "服务器尚未配置 DeepSeek 密钥"}), 503
-    client = request.headers.get("X-Forwarded-For", request.remote_addr or "unknown").split(",")[0].strip()
+    client = request.headers.get(
+        "X-Forwarded-For", request.remote_addr or "unknown"
+    ).split(",")[0].strip()
     elapsed = time.time() - _ai_calls.get(client, 0)
     if elapsed < AI_COOLDOWN_SECONDS:
         return jsonify({"error": f"请等待 {int(AI_COOLDOWN_SECONDS - elapsed) + 1} 秒后再生成"}), 429
@@ -400,6 +567,7 @@ def ai_generate():
     if not prompt or len(prompt) > 1200:
         return jsonify({"error": "请输入 1-1200 个字符的排班条件"}), 400
     try:
+        schedule_id = parse_schedule_id(payload.get("scheduleId"))
         start = parse_date(str(payload.get("start", "")), "start")
         end = parse_date(str(payload.get("end", "")), "end")
     except ValueError as exc:
@@ -416,10 +584,10 @@ def ai_generate():
         """
         SELECT s.shift_date, s.code, p.name
         FROM shifts s JOIN staff p ON p.id = s.staff_id
-        WHERE s.shift_date BETWEEN ? AND ? AND p.active = 1
+        WHERE s.schedule_id = ? AND s.shift_date BETWEEN ? AND ? AND p.active = 1
         ORDER BY s.shift_date, p.sort_order
         """,
-        (start, end),
+        (schedule_id, start, end),
     ).fetchall()
     current_schedule = [
         {"date": row["shift_date"], "person": row["name"], "shift": row["code"]}
@@ -444,7 +612,10 @@ def ai_generate():
             json={
                 "model": DEEPSEEK_MODEL,
                 "messages": [
-                    {"role": "system", "content": ai_system_prompt(list(staff_by_name), start, end)},
+                    {
+                        "role": "system",
+                        "content": ai_system_prompt(list(staff_by_name), start, end),
+                    },
                     {"role": "user", "content": user_message},
                 ],
                 "thinking": {"type": "disabled"},
@@ -460,7 +631,9 @@ def ai_generate():
         result = json.loads(content)
     except (requests.RequestException, KeyError, ValueError, json.JSONDecodeError) as exc:
         app.logger.exception("DeepSeek generation failed")
-        return jsonify({"error": "AI 暂时没有生成成功，请稍后重试", "detail": str(exc)[:180]}), 502
+        return jsonify(
+            {"error": "AI 暂时没有生成成功，请稍后重试", "detail": str(exc)[:180]}
+        ), 502
 
     raw_schedule = result.get("schedule")
     if not isinstance(raw_schedule, list):
@@ -479,7 +652,11 @@ def ai_generate():
         except ValueError:
             rejected += 1
             continue
-        if person not in staff_by_name or shift not in {"A", "B", "OFF"} or not (start <= item_date <= end):
+        if (
+            person not in staff_by_name
+            or shift not in {"A", "B", "OFF"}
+            or not (start <= item_date <= end)
+        ):
             rejected += 1
             continue
         staff_id = staff_by_name[person]
@@ -497,8 +674,11 @@ def ai_generate():
     previous_state = []
     for (staff_id, item_date), operation in operations.items():
         previous = db().execute(
-            "SELECT code, note, source, batch_id FROM shifts WHERE staff_id = ? AND shift_date = ?",
-            (staff_id, item_date),
+            """
+            SELECT code, note, source, batch_id FROM shifts
+            WHERE schedule_id = ? AND staff_id = ? AND shift_date = ?
+            """,
+            (schedule_id, staff_id, item_date),
         ).fetchone()
         previous_state.append(
             {
@@ -509,19 +689,21 @@ def ai_generate():
         )
         if operation["shift"] == "OFF":
             db().execute(
-                "DELETE FROM shifts WHERE staff_id = ? AND shift_date = ?",
-                (staff_id, item_date),
+                "DELETE FROM shifts WHERE schedule_id = ? AND staff_id = ? AND shift_date = ?",
+                (schedule_id, staff_id, item_date),
             )
         else:
             db().execute(
                 """
-                INSERT INTO shifts(staff_id, shift_date, code, note, source, batch_id, updated_at)
-                VALUES (?, ?, ?, ?, 'ai', ?, ?)
-                ON CONFLICT(staff_id, shift_date) DO UPDATE SET
+                INSERT INTO shifts(
+                    schedule_id, staff_id, shift_date, code, note, source, batch_id, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 'ai', ?, ?)
+                ON CONFLICT(schedule_id, staff_id, shift_date) DO UPDATE SET
                     code = excluded.code, note = excluded.note, source = 'ai',
                     batch_id = excluded.batch_id, updated_at = excluded.updated_at
                 """,
                 (
+                    schedule_id,
                     staff_id,
                     item_date,
                     operation["shift"],
@@ -532,9 +714,21 @@ def ai_generate():
             )
     summary = str(result.get("summary", "排班已经按条件生成"))[:240]
     db().execute(
-        "INSERT INTO ai_batches(id, prompt, summary, previous_state, created_at) VALUES (?, ?, ?, ?, ?)",
-        (batch_id, prompt, summary, json.dumps(previous_state, ensure_ascii=False), now_iso()),
+        """
+        INSERT INTO ai_batches(
+            id, schedule_id, prompt, summary, previous_state, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            batch_id,
+            schedule_id,
+            prompt,
+            summary,
+            json.dumps(previous_state, ensure_ascii=False),
+            now_iso(),
+        ),
     )
+    touch_schedule(schedule_id)
     db().commit()
     return jsonify(
         {
@@ -548,32 +742,37 @@ def ai_generate():
 
 
 @app.post("/api/ai/undo/<batch_id>")
-@require_access
 def ai_undo(batch_id: str):
     batch = db().execute("SELECT * FROM ai_batches WHERE id = ?", (batch_id,)).fetchone()
     if batch is None:
         return jsonify({"error": "未找到这次 AI 排班"}), 404
     if batch["undone_at"]:
         return jsonify({"error": "这次排班已经撤销"}), 409
+    if db().execute(
+        "SELECT id FROM schedules WHERE id = ?", (batch["schedule_id"],)
+    ).fetchone() is None:
+        return jsonify({"error": "对应排班表已被删除"}), 409
     previous_state = json.loads(batch["previous_state"])
     for item in previous_state:
         previous = item["previous"]
         staff_id, item_date = item["staffId"], item["date"]
         if previous is None:
             db().execute(
-                "DELETE FROM shifts WHERE staff_id = ? AND shift_date = ?",
-                (staff_id, item_date),
+                "DELETE FROM shifts WHERE schedule_id = ? AND staff_id = ? AND shift_date = ?",
+                (batch["schedule_id"], staff_id, item_date),
             )
         else:
             db().execute(
                 """
-                INSERT INTO shifts(staff_id, shift_date, code, note, source, batch_id, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(staff_id, shift_date) DO UPDATE SET
+                INSERT INTO shifts(
+                    schedule_id, staff_id, shift_date, code, note, source, batch_id, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(schedule_id, staff_id, shift_date) DO UPDATE SET
                     code = excluded.code, note = excluded.note, source = excluded.source,
                     batch_id = excluded.batch_id, updated_at = excluded.updated_at
                 """,
                 (
+                    batch["schedule_id"],
                     staff_id,
                     item_date,
                     previous["code"],
@@ -584,6 +783,7 @@ def ai_undo(batch_id: str):
                 ),
             )
     db().execute("UPDATE ai_batches SET undone_at = ? WHERE id = ?", (now_iso(), batch_id))
+    touch_schedule(batch["schedule_id"])
     db().commit()
     return jsonify({"ok": True})
 
@@ -603,4 +803,8 @@ init_database()
 
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=int(os.environ.get("PLAN_PORT", "8094")), debug=False)
+    app.run(
+        host="127.0.0.1",
+        port=int(os.environ.get("PLAN_PORT", "8094")),
+        debug=False,
+    )
