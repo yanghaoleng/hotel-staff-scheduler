@@ -898,11 +898,22 @@ def ai_generate():
         {"date": row["shift_date"], "person": row["name"], "shift": row["code"]}
         for row in existing_rows
     ]
+    fixed_rule_instructions = []
+    if rule_values["exactDailyAB"]:
+        fixed_rule_instructions.append(
+            "每天必须且只能安排 1 人 A 班和 1 人 B 班，其余人员当天必须安排为 OFF。"
+        )
+    if rule_values["offTransition"]:
+        fixed_rule_instructions.append(
+            "每段连续休假前的最后一个工作日必须为 A 班，休假结束后的第一个工作日必须为 B 班。"
+        )
     user_message = json.dumps(
         {
+            "task": "请先遵守以下固定规则，再满足用户条件，并返回完整且可直接保存的排班。",
             "today": date.today().isoformat(),
             "conditions": prompt,
             "fixed_rules": rule_values,
+            "fixed_rule_instructions": fixed_rule_instructions,
             "current_schedule": current_schedule,
         },
         ensure_ascii=False,
@@ -1029,6 +1040,7 @@ def ai_generate():
 
     batch_id = uuid.uuid4().hex
     previous_state = []
+    created_items = []
     for (staff_id, item_date), operation in operations.items():
         previous = db().execute(
             """
@@ -1044,6 +1056,8 @@ def ai_generate():
                 "previous": dict(previous) if previous else None,
             }
         )
+        if previous is None:
+            created_items.append({"staffId": staff_id, "date": item_date})
         db().execute(
             """
             INSERT INTO shifts(
@@ -1087,6 +1101,7 @@ def ai_generate():
             "batchId": batch_id,
             "summary": summary,
             "changed": len(operations),
+            "created": created_items,
             "rejected": rejected,
         }
     )

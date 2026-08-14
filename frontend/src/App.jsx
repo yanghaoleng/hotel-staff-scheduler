@@ -34,7 +34,8 @@ import {
   Eye,
   EyeSlash,
   GearSix,
-  Lightning,
+  Keyboard,
+  MagicWand,
   PencilSimple,
   Plus,
   Trash,
@@ -49,6 +50,7 @@ const SHIFT_META = {
   B: { label: "B", name: "晚班", time: "15:00-23:00" },
   OFF: { label: "休", name: "休假", time: "不排班" },
 };
+const SHIFT_ORDER = { A: 0, B: 1, OFF: 2 };
 const WORK_SHIFT_CODES = new Set(["A", "B"]);
 const THEME_COLORS = { light: "#f4f1e8", dark: "#181713" };
 const STAFF_COLORS = ["#ef6a5b", "#4c7ee8", "#2f9b77", "#d69232", "#8b68c9", "#c85682"];
@@ -82,7 +84,7 @@ function rgba(hex, alpha) {
   return `rgba(${r}, ${g}, ${b}, ${alpha})`;
 }
 
-function ShiftCard({ shift, onEdit, ghost = false }) {
+function ShiftCard({ shift, onEdit, ghost = false, revealIndex, reduceMotion = false }) {
   const { attributes, listeners, setNodeRef, transform, isDragging } = useDraggable({
     id: `shift-${shift.id}`,
     data: { shift },
@@ -93,6 +95,7 @@ function ShiftCard({ shift, onEdit, ghost = false }) {
     "--person-soft": rgba(shift.color, 0.14),
     transform: transform ? `translate3d(${transform.x}px, ${transform.y}px, 0)` : undefined,
   };
+  const shouldReveal = !ghost && !reduceMotion && Number.isInteger(revealIndex);
   return (
     <motion.button
       ref={setNodeRef}
@@ -101,6 +104,20 @@ function ShiftCard({ shift, onEdit, ghost = false }) {
       className={`shift-card ${shift.code === "OFF" ? "is-off" : ""} ${isDragging ? "is-dragging" : ""} ${ghost ? "is-ghost" : ""}`}
       aria-label={`${SHIFT_META[shift.code]?.name || shift.code} ${shift.person}`}
       style={style}
+      initial={shouldReveal ? {
+        opacity: 0,
+        y: -50,
+        rotate: revealIndex % 2 === 0 ? -7 : 7,
+        scale: 0.92,
+      } : false}
+      animate={{ opacity: 1, y: 0, rotate: 0, scale: 1 }}
+      transition={shouldReveal ? {
+        type: "spring",
+        stiffness: 250,
+        damping: 16,
+        mass: 0.72,
+        delay: revealIndex * 0.065,
+      } : { duration: 0.18 }}
       onClick={(event) => {
         event.stopPropagation();
         if (!isDragging && !ghost) onEdit(shift);
@@ -111,42 +128,130 @@ function ShiftCard({ shift, onEdit, ghost = false }) {
       {...listeners}
       {...attributes}
     >
+      <span className="shift-accent-line" aria-hidden="true" />
       <span className="shift-name shift-name-full">{shift.person}</span>
       <span className="shift-name shift-name-short" aria-hidden="true">{shift.person.slice(0, 1)}</span>
     </motion.button>
   );
 }
 
-function ShiftLane({ dateValue, code, shifts, onAdd, onEdit }) {
+function ShiftLane({
+  dateValue,
+  code,
+  shifts,
+  assignedStaffIds,
+  staff,
+  quickAdd,
+  onQuickAddToggle,
+  onQuickAdd,
+  onEdit,
+  revealOrder,
+  reduceMotion,
+  busy,
+}) {
   const { isOver, setNodeRef } = useDroppable({
     id: `lane-${dateValue}-${code}`,
     data: { date: dateValue, code },
   });
   const meta = SHIFT_META[code];
+  const menuOpen = quickAdd?.date === dateValue && quickAdd?.code === code;
   return (
     <div
       ref={setNodeRef}
-      className={`shift-lane is-${code.toLowerCase()} ${isOver ? "is-over" : ""}`}
-      onDoubleClick={() => onAdd(dateValue, code)}
+      className={`shift-lane is-${code.toLowerCase()} ${isOver ? "is-over" : ""} ${menuOpen ? "has-menu" : ""}`}
     >
       <span className="lane-label" title={meta.name}>{meta.label}</span>
       <div className="lane-cards">
         <AnimatePresence initial={false} mode="popLayout">
-          {shifts.map((shift) => <ShiftCard key={shift.id} shift={shift} onEdit={onEdit} />)}
+          {shifts.map((shift) => (
+            <ShiftCard
+              key={shift.id}
+              shift={shift}
+              onEdit={onEdit}
+              revealIndex={revealOrder.get(shift.id)}
+              reduceMotion={reduceMotion}
+            />
+          ))}
         </AnimatePresence>
-        {shifts.length === 0 && <span className="lane-empty">{isOver ? `放到${meta.name}` : "+"}</span>}
+        {shifts.length === 0 && <span className="lane-empty">{isOver ? `放到${meta.name}` : ""}</span>}
+      </div>
+      <div className="quick-add-control">
+        <button
+          className="lane-add"
+          type="button"
+          onClick={(event) => {
+            event.stopPropagation();
+            onQuickAddToggle({ date: dateValue, code });
+          }}
+          aria-label={`${dateValue} ${meta.name}添加人员`}
+          aria-expanded={menuOpen}
+          aria-haspopup="menu"
+        >
+          <Plus size={12} weight="bold" />
+        </button>
+        <AnimatePresence>
+          {menuOpen && (
+            <motion.div
+              className="quick-person-menu"
+              initial={reduceMotion ? false : { opacity: 0, y: -5, scale: 0.96 }}
+              animate={{ opacity: 1, y: 0, scale: 1 }}
+              exit={{ opacity: 0, y: -3, scale: 0.97 }}
+              transition={{ duration: 0.16, ease: [0.16, 1, 0.3, 1] }}
+              role="menu"
+              aria-label={`${dateValue} ${meta.name}选择人员`}
+            >
+              {staff.map((person) => {
+                const assigned = assignedStaffIds.has(person.id);
+                return (
+                  <button
+                    type="button"
+                    role="menuitem"
+                    key={person.id}
+                    disabled={assigned || busy}
+                    title={assigned ? "当天已有安排" : `安排 ${person.name}`}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      onQuickAdd(person.id, dateValue, code);
+                    }}
+                  >
+                    <i style={{ background: person.color }} />
+                    <span>{person.name}</span>
+                    {assigned && <small>已排</small>}
+                  </button>
+                );
+              })}
+            </motion.div>
+          )}
+        </AnimatePresence>
       </div>
     </div>
   );
 }
 
-function DayCell({ day, currentMonth, shifts, onAdd, onEdit, selected, onSelectStart, onSelectEnter }) {
+function DayCell({
+  day,
+  currentMonth,
+  shifts,
+  dayShifts,
+  staff,
+  onEdit,
+  selected,
+  onSelectStart,
+  onSelectEnter,
+  quickAdd,
+  onQuickAddToggle,
+  onQuickAdd,
+  revealOrder,
+  reduceMotion,
+  busy,
+}) {
   const iso = format(day, "yyyy-MM-dd");
   const today = isSameDay(day, new Date());
+  const assignedStaffIds = new Set(dayShifts.map((shift) => shift.staffId));
   return (
     <div
       data-date={iso}
-      className={`day-cell ${!isSameMonth(day, currentMonth) ? "is-outside" : ""} ${today ? "is-today" : ""} ${selected ? "is-selected" : ""}`}
+      className={`day-cell ${!isSameMonth(day, currentMonth) ? "is-outside" : ""} ${today ? "is-today" : ""} ${selected ? "is-selected" : ""} ${quickAdd?.date === iso ? "has-quick-menu" : ""}`}
       onPointerDown={(event) => {
         if (event.pointerType === "touch" || event.button !== 0 || event.target.closest("button, .shift-card")) return;
         event.preventDefault();
@@ -159,9 +264,6 @@ function DayCell({ day, currentMonth, shifts, onAdd, onEdit, selected, onSelectS
           <span className="day-number">{format(day, "d")}</span>
           {format(day, "d") === "1" && <span className="day-month">{format(day, "M月")}</span>}
         </div>
-        <button className="day-add" type="button" onClick={() => onAdd(iso, "A")} aria-label={`${iso} 添加班次`}>
-          <Plus size={13} weight="bold" />
-        </button>
       </div>
       <div className="day-lanes">
         {Object.keys(SHIFT_META).map((code) => (
@@ -170,8 +272,15 @@ function DayCell({ day, currentMonth, shifts, onAdd, onEdit, selected, onSelectS
             dateValue={iso}
             code={code}
             shifts={shifts.filter((shift) => shift.code === code)}
-            onAdd={onAdd}
+            assignedStaffIds={assignedStaffIds}
+            staff={staff}
+            quickAdd={quickAdd}
+            onQuickAddToggle={onQuickAddToggle}
+            onQuickAdd={onQuickAdd}
             onEdit={onEdit}
+            revealOrder={revealOrder}
+            reduceMotion={reduceMotion}
+            busy={busy}
           />
         ))}
       </div>
@@ -298,68 +407,94 @@ function ShiftEditor({ initial, staff, onSave, onDelete, onClose, busy }) {
 function SettingsEditor({ staff, rules, onAdd, onUpdate, onUpdateRules, onClose, busy }) {
   const [newName, setNewName] = useState("");
   const [newColor, setNewColor] = useState(STAFF_COLORS[4]);
+  const [deleteCandidate, setDeleteCandidate] = useState(null);
   return (
-    <Modal title="排班设置" subtitle="当前 Sheet 的固定规则与参与人员" onClose={onClose}>
-      <section className="rules-editor">
-        <header><strong>固定排班规则</strong><span>当前 Sheet</span></header>
-        <label className="rule-row">
-          <span>
-            <strong>每天 1 个 A、1 个 B</strong>
-            <small>其他人当天休假，AI 生成后会自动校验</small>
-          </span>
-          <input
-            type="checkbox"
-            checked={rules.exactDailyAB}
-            onChange={(event) => onUpdateRules({ ...rules, exactDailyAB: event.target.checked })}
-            disabled={busy}
-          />
-          <i aria-hidden="true" />
-        </label>
-        <label className="rule-row">
-          <span>
-            <strong>休假前 A，收假后 B</strong>
-            <small>连续休假前的最后一班为 A，收假第一班为 B</small>
-          </span>
-          <input
-            type="checkbox"
-            checked={rules.offTransition}
-            onChange={(event) => onUpdateRules({ ...rules, offTransition: event.target.checked })}
-            disabled={busy}
-          />
-          <i aria-hidden="true" />
-        </label>
-      </section>
-      <div className="settings-section-title"><strong>参与人员</strong><span>每人一种颜色</span></div>
-      <div className="staff-editor-list">
-        {staff.map((person) => (
-          <div className="staff-editor-row" key={person.id}>
+    <>
+      <Modal title="排班设置" subtitle="当前 Sheet 的固定规则与参与人员" onClose={() => (deleteCandidate ? setDeleteCandidate(null) : onClose())}>
+        <section className="rules-editor">
+          <header><strong>固定排班规则</strong><span>当前 Sheet</span></header>
+          <label className="rule-row">
+            <span>
+              <strong>每天 1 个 A、1 个 B</strong>
+              <small>规则会随条件一起发给 AI，并在保存前校验</small>
+            </span>
             <input
-              aria-label={`${person.name} 颜色`}
-              type="color"
-              value={person.color}
-              onChange={(event) => onUpdate(person.id, { color: event.target.value })}
+              type="checkbox"
+              checked={rules.exactDailyAB}
+              onChange={(event) => onUpdateRules({ ...rules, exactDailyAB: event.target.checked })}
+              disabled={busy}
             />
-            <span>{person.name}</span>
-            <button type="button" onClick={() => onUpdate(person.id, { active: false })}>停用</button>
-          </div>
-        ))}
-      </div>
-      <form
-        className="add-staff-form"
-        onSubmit={(event) => {
-          event.preventDefault();
-          if (!newName.trim()) return;
-          onAdd({ name: newName.trim(), color: newColor }).then(() => setNewName(""));
-        }}
-      >
-        <label htmlFor="new-person">添加员工</label>
-        <div>
-          <input type="color" value={newColor} onChange={(event) => setNewColor(event.target.value)} aria-label="新员工颜色" />
-          <input id="new-person" value={newName} onChange={(event) => setNewName(event.target.value)} placeholder="输入姓名" maxLength={20} />
-          <button className="primary-button" disabled={busy || !newName.trim()} type="submit"><Plus size={17} /> 添加</button>
+            <i aria-hidden="true" />
+          </label>
+          <label className="rule-row">
+            <span>
+              <strong>休假前 A，收假后 B</strong>
+              <small>连续休假前的最后一班为 A，收假第一班为 B</small>
+            </span>
+            <input
+              type="checkbox"
+              checked={rules.offTransition}
+              onChange={(event) => onUpdateRules({ ...rules, offTransition: event.target.checked })}
+              disabled={busy}
+            />
+            <i aria-hidden="true" />
+          </label>
+        </section>
+        <div className="settings-section-title"><strong>参与人员</strong><span>每人一种颜色</span></div>
+        <div className="staff-editor-list">
+          {staff.map((person) => (
+            <div className="staff-editor-row" key={person.id}>
+              <input
+                aria-label={`${person.name} 颜色`}
+                type="color"
+                value={person.color}
+                onChange={(event) => onUpdate(person.id, { color: event.target.value })}
+              />
+              <span>{person.name}</span>
+              <button type="button" onClick={() => setDeleteCandidate(person)}>删除</button>
+            </div>
+          ))}
         </div>
-      </form>
-    </Modal>
+        <form
+          className="add-staff-form"
+          onSubmit={(event) => {
+            event.preventDefault();
+            if (!newName.trim()) return;
+            onAdd({ name: newName.trim(), color: newColor }).then(() => setNewName(""));
+          }}
+        >
+          <label htmlFor="new-person">添加员工</label>
+          <div>
+            <input type="color" value={newColor} onChange={(event) => setNewColor(event.target.value)} aria-label="新员工颜色" />
+            <input id="new-person" value={newName} onChange={(event) => setNewName(event.target.value)} placeholder="输入姓名" maxLength={20} />
+            <button className="primary-button" disabled={busy || !newName.trim()} type="submit"><Plus size={17} /> 添加</button>
+          </div>
+        </form>
+      </Modal>
+      <AnimatePresence>
+        {deleteCandidate && (
+          <Modal title="删除这位人员？" subtitle="历史排班记录会保留" onClose={() => setDeleteCandidate(null)}>
+            <div className="confirm-staff-delete">
+              <p>确定从参与人员中删除 <strong>{deleteCandidate.name}</strong> 吗？以后可以用同名重新添加并恢复。</p>
+              <div>
+                <button className="secondary-button" type="button" onClick={() => setDeleteCandidate(null)}>取消</button>
+                <button
+                  className="danger-button solid"
+                  type="button"
+                  disabled={busy}
+                  onClick={async () => {
+                    const updated = await onUpdate(deleteCandidate.id, { active: false });
+                    if (updated) setDeleteCandidate(null);
+                  }}
+                >
+                  {busy ? <span className="button-loader" /> : <Trash size={17} />} 确认删除
+                </button>
+              </div>
+            </div>
+          </Modal>
+        )}
+      </AnimatePresence>
+    </>
   );
 }
 
@@ -468,12 +603,18 @@ function Scheduler() {
   const [activeBatch, setActiveBatch] = useState(null);
   const [toasts, setToasts] = useState([]);
   const [statsOpen, setStatsOpen] = useState(false);
+  const [shortcutsOpen, setShortcutsOpen] = useState(false);
+  const [shortcutsPinned, setShortcutsPinned] = useState(false);
   const [hiddenStaffIds, setHiddenStaffIds] = useState(() => new Set());
   const [selectionAnchor, setSelectionAnchor] = useState(null);
   const [selectionEnd, setSelectionEnd] = useState(null);
   const [selectionDragging, setSelectionDragging] = useState(false);
+  const [quickAdd, setQuickAdd] = useState(null);
+  const [aiRevealOrder, setAiRevealOrder] = useState(() => new Map());
   const longPressTimer = useRef(null);
+  const aiRevealTimer = useRef(null);
   const statsRef = useRef(null);
+  const shortcutsRef = useRef(null);
   const clearUndoRef = useRef(null);
   const reduceMotion = useReducedMotion();
 
@@ -542,7 +683,23 @@ function Scheduler() {
     };
   }, [statsOpen]);
 
-  async function loadData({ quiet = false, scheduleId = activeScheduleId } = {}) {
+  useEffect(() => {
+    if (!shortcutsOpen) return undefined;
+    const closeShortcuts = (event) => {
+      if (event.key === "Escape" || (event.type === "pointerdown" && !shortcutsRef.current?.contains(event.target))) {
+        setShortcutsOpen(false);
+        setShortcutsPinned(false);
+      }
+    };
+    document.addEventListener("pointerdown", closeShortcuts);
+    document.addEventListener("keydown", closeShortcuts);
+    return () => {
+      document.removeEventListener("pointerdown", closeShortcuts);
+      document.removeEventListener("keydown", closeShortcuts);
+    };
+  }, [shortcutsOpen]);
+
+  async function loadData({ quiet = false, scheduleId = activeScheduleId, revealKeys = null } = {}) {
     if (!quiet) setLoading(true);
     try {
       const scheduleQuery = scheduleId ? `&scheduleId=${scheduleId}` : "";
@@ -551,14 +708,30 @@ function Scheduler() {
       setActiveScheduleId(data.activeSchedule.id);
       localStorage.setItem("plan-sheet", String(data.activeSchedule.id));
       setStaff(data.staff);
+      if (revealKeys) {
+        const arriving = data.shifts
+          .filter((shift) => revealKeys.has(`${shift.staffId}:${shift.date}`))
+          .sort((left, right) => left.date.localeCompare(right.date)
+            || SHIFT_ORDER[left.code] - SHIFT_ORDER[right.code]
+            || left.person.localeCompare(right.person, "zh-CN"));
+        const order = new Map(arriving.map((shift, index) => [shift.id, index]));
+        setAiRevealOrder(order);
+        window.clearTimeout(aiRevealTimer.current);
+        aiRevealTimer.current = window.setTimeout(
+          () => setAiRevealOrder(new Map()),
+          Math.max(1200, arriving.length * 65 + 900),
+        );
+      }
       setShifts(data.shifts);
       setRules(data.rules);
       setAiInfo(data.ai);
+      return data;
     } catch (error) {
       toast(error.message, "error");
     } finally {
       setLoading(false);
     }
+    return null;
   }
 
   useEffect(() => { loadData(); }, [startIso, endIso, activeScheduleId]);
@@ -578,13 +751,34 @@ function Scheduler() {
     };
   }, []);
 
-  useEffect(() => () => window.clearTimeout(longPressTimer.current), []);
+  useEffect(() => () => {
+    window.clearTimeout(longPressTimer.current);
+    window.clearTimeout(aiRevealTimer.current);
+  }, []);
 
   useEffect(() => {
     setSelectionAnchor(null);
     setSelectionEnd(null);
     setSelectionDragging(false);
+    setQuickAdd(null);
+    setAiRevealOrder(new Map());
+    window.clearTimeout(aiRevealTimer.current);
   }, [activeScheduleId, month]);
+
+  useEffect(() => {
+    if (!quickAdd) return undefined;
+    const closeQuickAdd = (event) => {
+      if (event.key === "Escape" || (event.type === "pointerdown" && !event.target.closest?.(".quick-add-control"))) {
+        setQuickAdd(null);
+      }
+    };
+    document.addEventListener("pointerdown", closeQuickAdd);
+    document.addEventListener("keydown", closeQuickAdd);
+    return () => {
+      document.removeEventListener("pointerdown", closeQuickAdd);
+      document.removeEventListener("keydown", closeQuickAdd);
+    };
+  }, [quickAdd]);
 
   useEffect(() => {
     if (!selectedDates.length) return undefined;
@@ -592,7 +786,7 @@ function Scheduler() {
       const target = event.target;
       if (!(target instanceof Element)) return;
       const keepsSelection = target.closest(
-        ".day-cell, .selection-toolbar, button, input, textarea, select, a, [contenteditable='true'], .modal-card",
+        ".day-cell, .selection-toolbar, .shortcut-help, button, input, textarea, select, a, [contenteditable='true'], .modal-card",
       );
       if (!keepsSelection) clearDateSelection();
     };
@@ -610,6 +804,15 @@ function Scheduler() {
     });
     return grouped;
   }, [hiddenStaffIds, shifts]);
+  const allShiftsByDay = useMemo(() => {
+    const grouped = new Map();
+    shifts.forEach((shift) => {
+      const list = grouped.get(shift.date) || [];
+      list.push(shift);
+      grouped.set(shift.date, list);
+    });
+    return grouped;
+  }, [shifts]);
 
   const monthShifts = useMemo(
     () => shifts.filter((shift) => isSameMonth(parseISO(shift.date), month)),
@@ -755,7 +958,7 @@ function Scheduler() {
       };
       clearUndoRef.current = undoEntry;
       undoEntry.toastId = toast(`已清空 ${result.deleted} 条记录`, "success", {
-        label: `撤销 ${SHORTCUT_MODIFIER} Z`,
+        label: "撤销",
         onClick: () => undoClearedShifts(undoEntry),
       }, 10000);
       window.setTimeout(() => {
@@ -822,6 +1025,11 @@ function Scheduler() {
     }
   }
 
+  async function quickAddShift(staffId, dateValue, codeValue) {
+    setQuickAdd(null);
+    await saveShift({ staffId, date: dateValue, code: codeValue, note: "" });
+  }
+
   async function deleteShift(value) {
     setBusy(true);
     try {
@@ -866,7 +1074,10 @@ function Scheduler() {
       });
       setActiveBatch(result.batchId);
       setAiPrompt("");
-      await loadData({ quiet: true });
+      const revealKeys = new Set(
+        (result.created || []).map((item) => `${item.staffId}:${item.date}`),
+      );
+      await loadData({ quiet: true, revealKeys });
       toast(`${result.summary}，共调整 ${result.changed} 个班次`, "success", {
         label: "撤销",
         onClick: () => undoAi(result.batchId),
@@ -909,8 +1120,10 @@ function Scheduler() {
       if (result.staff.active) setStaff((current) => current.map((item) => item.id === id ? result.staff : item));
       else setStaff((current) => current.filter((item) => item.id !== id));
       await loadData({ quiet: true });
+      return true;
     } catch (error) {
       toast(error.message, "error");
+      return false;
     }
   }
 
@@ -1017,6 +1230,49 @@ function Scheduler() {
               <Plus size={14} weight="bold" /> 新建 Sheet
             </button>
           </div>
+          <div
+            className="shortcut-help"
+            ref={shortcutsRef}
+            onMouseEnter={() => setShortcutsOpen(true)}
+            onMouseLeave={() => {
+              if (!shortcutsPinned) setShortcutsOpen(false);
+            }}
+          >
+            <button
+              className="shortcut-trigger"
+              type="button"
+              onClick={() => {
+                setShortcutsOpen(true);
+                setShortcutsPinned((value) => !value);
+              }}
+              aria-label="查看快捷键"
+              aria-expanded={shortcutsOpen}
+              aria-haspopup="dialog"
+            >
+              <Keyboard size={18} />
+            </button>
+            <AnimatePresence>
+              {shortcutsOpen && (
+                <motion.div
+                  className="shortcut-popover"
+                  initial={reduceMotion ? false : { opacity: 0, y: -5, scale: 0.97 }}
+                  animate={{ opacity: 1, y: 0, scale: 1 }}
+                  exit={{ opacity: 0, y: -3, scale: 0.98 }}
+                  transition={{ duration: 0.16, ease: [0.16, 1, 0.3, 1] }}
+                  role="dialog"
+                  aria-label="快捷键"
+                >
+                  <strong>快捷键</strong>
+                  <div><span>AI 输入框生成</span><kbd>Enter</kbd></div>
+                  <div><span>AI 输入框换行</span><kbd>Shift Enter</kbd></div>
+                  <div><span>复制选中日期</span><kbd>{SHORTCUT_MODIFIER} C</kbd></div>
+                  <div><span>清空选中日期</span><kbd>Delete</kbd></div>
+                  <div><span>撤销清空</span><kbd>{SHORTCUT_MODIFIER} Z</kbd></div>
+                  <div><span>取消选择或关闭</span><kbd>Esc</kbd></div>
+                </motion.div>
+              )}
+            </AnimatePresence>
+          </div>
         </nav>
 
         <div className="workspace">
@@ -1026,12 +1282,18 @@ function Scheduler() {
                 <textarea
                   value={aiPrompt}
                   onChange={(event) => setAiPrompt(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" && !event.shiftKey && !event.nativeEvent.isComposing) {
+                      event.preventDefault();
+                      if (aiPrompt.trim() && !aiBusy && aiInfo.configured) generateSchedule();
+                    }
+                  }}
                   placeholder="比如：每人最多连上 4 天，XXX 尽量排周末两天休假，早晚班尽量平均，XXX 避免 B 班后紧跟 A 班。"
                   rows={6}
                   disabled={!aiInfo.configured || aiBusy}
                 />
                 <button className="ai-generate" type="button" onClick={generateSchedule} disabled={!aiPrompt.trim() || aiBusy || !aiInfo.configured}>
-                  {aiBusy ? <><span className="button-loader" /> 正在安排</> : <><Lightning size={17} weight="fill" /> 生成 {format(month, "M月")}排班</>}
+                  {aiBusy ? <><span className="button-loader" /> 正在安排</> : <><MagicWand size={17} weight="fill" /> 生成 {format(month, "M月")}排班</>}
                 </button>
                 {!aiInfo.configured && <p className="ai-warning">服务器还未配置 AI 密钥</p>}
                 {activeBatch && <button className="undo-link" type="button" onClick={() => undoAi()}><ArrowCounterClockwise size={14} /> 撤销最近一次 AI 排班</button>}
@@ -1132,11 +1394,20 @@ function Scheduler() {
                       day={day}
                       currentMonth={month}
                       shifts={shiftsByDay.get(iso) || []}
-                      onAdd={(dateValue, code) => setEditor({ date: dateValue, code })}
+                      dayShifts={allShiftsByDay.get(iso) || []}
+                      staff={staff}
                       onEdit={setEditor}
                       selected={selectedDateSet.has(iso)}
                       onSelectStart={startDateSelection}
                       onSelectEnter={extendDateSelection}
+                      quickAdd={quickAdd}
+                      onQuickAddToggle={(target) => setQuickAdd((current) => (
+                        current?.date === target.date && current?.code === target.code ? null : target
+                      ))}
+                      onQuickAdd={quickAddShift}
+                      revealOrder={aiRevealOrder}
+                      reduceMotion={reduceMotion}
+                      busy={busy}
                     />
                   );
                 })}
@@ -1164,14 +1435,13 @@ function Scheduler() {
           >
             <span>
               <strong>{selectedDates.length}</strong> 天
-              <small>{format(parseISO(selectedDates[0]), "M月d日")}{selectedDates.length > 1 ? ` – ${format(parseISO(selectedDates.at(-1)), "M月d日")}` : ""}</small>
+              <small>{format(parseISO(selectedDates[0]), "M月d日")}{selectedDates.length > 1 ? ` - ${format(parseISO(selectedDates.at(-1)), "M月d日")}` : ""}</small>
             </span>
             <i />
             <button type="button" onClick={copySelectionForExcel}>
               <CopySimple size={16} /> 复制到 Excel
-              <kbd>{SHORTCUT_MODIFIER} C</kbd>
             </button>
-            <button className="is-danger" type="button" onClick={clearSelectedDates} disabled={busy}><Trash size={16} /> 清空 <kbd>Delete</kbd></button>
+            <button className="is-danger" type="button" onClick={clearSelectedDates} disabled={busy}><Trash size={16} /> 清空</button>
             <button className="selection-close" type="button" onClick={clearDateSelection} aria-label="取消选择"><X size={16} /></button>
           </motion.div>
         )}
