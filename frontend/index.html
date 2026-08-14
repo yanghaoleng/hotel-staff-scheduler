@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
-    <meta name="theme-color" content="#f2f3ef" />
+    <meta name="theme-color" content="#f4f1e8" />
     <meta name="color-scheme" content="light dark" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
@@ -11,7 +11,7 @@
       try {
         const dark = matchMedia("(prefers-color-scheme: dark)").matches;
         const resolvedTheme = dark ? "dark" : "light";
-        const themeColor = dark ? "#171a18" : "#f2f3ef";
+        const themeColor = dark ? "#181713" : "#f4f1e8";
         localStorage.removeItem("plan-theme");
         document.documentElement.dataset.theme = resolvedTheme;
         document.documentElement.style.backgroundColor = themeColor;
