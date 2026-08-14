@@ -691,6 +691,15 @@ def bulk_delete_shifts():
 
     placeholders = ",".join("?" for _ in dates)
     parameters = [schedule_id, *dates]
+    deleted_rows = db().execute(
+        f"""
+        SELECT staff_id, shift_date, code, note, source, batch_id
+        FROM shifts
+        WHERE schedule_id = ? AND shift_date IN ({placeholders})
+        ORDER BY shift_date, staff_id
+        """,
+        parameters,
+    ).fetchall()
     counts = db().execute(
         f"""
         SELECT COUNT(*) AS total,
@@ -706,7 +715,105 @@ def bulk_delete_shifts():
     )
     touch_schedule(schedule_id)
     db().commit()
-    return jsonify({"ok": True, "deleted": counts["total"], "workDeleted": counts["work"]})
+    return jsonify(
+        {
+            "ok": True,
+            "deleted": counts["total"],
+            "workDeleted": counts["work"],
+            "undo": [
+                {
+                    "staffId": row["staff_id"],
+                    "date": row["shift_date"],
+                    "code": row["code"],
+                    "note": row["note"],
+                    "source": row["source"],
+                    "batchId": row["batch_id"],
+                }
+                for row in deleted_rows
+            ],
+        }
+    )
+
+
+@app.post("/api/shifts/bulk-restore")
+def bulk_restore_shifts():
+    payload = request.get_json(silent=True) or {}
+    try:
+        schedule_id = parse_schedule_id(payload.get("scheduleId"))
+        raw_shifts = payload.get("shifts")
+        if not isinstance(raw_shifts, list) or not 1 <= len(raw_shifts) <= 1000:
+            raise ValueError("没有可恢复的排班")
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    staff_ids = {
+        row["id"] for row in db().execute("SELECT id FROM staff").fetchall()
+    }
+    operations: dict[tuple[int, str], dict[str, Any]] = {}
+    try:
+        for item in raw_shifts:
+            if not isinstance(item, dict):
+                raise ValueError("恢复数据不完整")
+            staff_id = int(item.get("staffId"))
+            shift_date = parse_date(str(item.get("date", "")))
+            code = str(item.get("code", "")).upper()
+            if staff_id not in staff_ids or code not in ALLOWED_SHIFT_CODES:
+                raise ValueError("恢复数据不完整")
+            source = str(item.get("source", "manual"))
+            if source not in {"manual", "import", "ai"}:
+                source = "manual"
+            batch_id = item.get("batchId")
+            operations[(staff_id, shift_date)] = {
+                "staffId": staff_id,
+                "date": shift_date,
+                "code": code,
+                "note": str(item.get("note", ""))[:200],
+                "source": source,
+                "batchId": str(batch_id)[:64] if batch_id else None,
+            }
+    except (TypeError, ValueError) as exc:
+        return jsonify({"error": str(exc) or "恢复数据不完整"}), 400
+
+    restored = []
+    work_restored = 0
+    for item in operations.values():
+        cursor = db().execute(
+            """
+            INSERT INTO shifts(
+                schedule_id, staff_id, shift_date, code, note,
+                source, batch_id, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(schedule_id, staff_id, shift_date) DO NOTHING
+            """,
+            (
+                schedule_id,
+                item["staffId"],
+                item["date"],
+                item["code"],
+                item["note"],
+                item["source"],
+                item["batchId"],
+                now_iso(),
+            ),
+        )
+        if cursor.rowcount != 1:
+            continue
+        restored_row = fetch_shift(cursor.lastrowid)
+        if restored_row is not None:
+            restored.append(shift_payload(restored_row))
+            work_restored += int(item["code"] in {"A", "B"})
+
+    if restored:
+        touch_schedule(schedule_id)
+    db().commit()
+    return jsonify(
+        {
+            "ok": True,
+            "restored": len(restored),
+            "workRestored": work_restored,
+            "shifts": restored,
+        }
+    )
 
 
 def ai_system_prompt(
