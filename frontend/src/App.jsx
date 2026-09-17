@@ -269,6 +269,7 @@ function ShiftLane({
 function DayCell({
   day,
   currentMonth,
+  holiday,
   shifts,
   dayShifts,
   staff,
@@ -301,6 +302,7 @@ function DayCell({
         <div>
           <span className="day-number">{format(day, "d")}</span>
           {format(day, "d") === "1" && <span className="day-month">{format(day, "M月")}</span>}
+          {holiday && <span className={`holiday-label is-${holiday.kind}`} title={holiday.name}>{holiday.name}</span>}
         </div>
       </div>
       <div className="day-lanes">
@@ -627,6 +629,7 @@ function Scheduler() {
   const [activeScheduleId, setActiveScheduleId] = useState(() => Number(localStorage.getItem("plan-sheet")) || null);
   const [staff, setStaff] = useState([]);
   const [shifts, setShifts] = useState([]);
+  const [holidays, setHolidays] = useState({});
   const [rules, setRules] = useState({ exactDailyAB: true, offTransition: true });
   const [speechInfo, setSpeechInfo] = useState({ configured: false });
   const [loading, setLoading] = useState(true);
@@ -909,6 +912,7 @@ function Scheduler() {
         );
       }
       setShifts(data.shifts);
+      setHolidays(data.holidays || {});
       setRules(data.rules);
       setSpeechInfo(data.speech || { configured: false });
       return data;
@@ -1701,6 +1705,7 @@ function Scheduler() {
                       key={iso}
                       day={day}
                       currentMonth={month}
+                      holiday={holidays[iso]}
                       shifts={shiftsByDay.get(iso) || []}
                       dayShifts={allShiftsByDay.get(iso) || []}
                       staff={staff}

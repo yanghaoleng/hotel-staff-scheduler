@@ -63,16 +63,84 @@ DEEPSEEK_MODEL = "deepseek-v4-flash"
 DOUBAO_ASR_API_KEY = os.environ.get("DOUBAO_ASR_API_KEY", "")
 ALLOWED_SHIFT_CODES = {"A", "B", "OFF"}
 AI_COOLDOWN_SECONDS = 12
+HOLIDAY_CALENDAR_URL = "https://calendars.icloud.com/holidays/cn_zh.ics/"
+HOLIDAY_CACHE_SECONDS = 12 * 60 * 60
 
 app = Flask(__name__, static_folder=str(STATIC_DIR), static_url_path="")
 app.config["JSON_AS_ASCII"] = False
 sock = Sock(app)
 
 _ai_calls: dict[str, float] = {}
+_holiday_cache: dict[str, Any] = {"loaded_at": 0.0, "dates": {}}
+_holiday_cache_lock = threading.Lock()
 
 
 def now_iso() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def parse_ical_date(value: str) -> date:
+    """Read the all-day dates used by Apple's holiday calendar."""
+    normalized = value.strip()
+    if len(normalized) == 8 and normalized.isdigit():
+        normalized = f"{normalized[:4]}-{normalized[4:6]}-{normalized[6:]}"
+    return date.fromisoformat(normalized[:10])
+
+
+def mainland_holidays() -> dict[str, dict[str, str]]:
+    """Fetch Apple Mainland China work-holiday data with a short server cache."""
+    with _holiday_cache_lock:
+        if time.time() - _holiday_cache["loaded_at"] < HOLIDAY_CACHE_SECONDS:
+            return _holiday_cache["dates"]
+        try:
+            response = requests.get(HOLIDAY_CALENDAR_URL, timeout=12)
+            response.raise_for_status()
+            # RFC 5545 lets a logical line continue after a newline plus whitespace.
+            lines = response.text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+            unfolded: list[str] = []
+            for line in lines:
+                if line.startswith((" ", "\t")) and unfolded:
+                    unfolded[-1] += line[1:]
+                else:
+                    unfolded.append(line)
+
+            events: list[dict[str, str]] = []
+            event: dict[str, str] | None = None
+            for line in unfolded:
+                if line == "BEGIN:VEVENT":
+                    event = {}
+                elif line == "END:VEVENT":
+                    if event is not None:
+                        events.append(event)
+                    event = None
+                elif event is not None and ":" in line:
+                    key, value = line.split(":", 1)
+                    event[key.split(";", 1)[0]] = value
+
+            holidays: dict[str, dict[str, str]] = {}
+            for event in events:
+                special_day = event.get("X-APPLE-SPECIAL-DAY")
+                if special_day not in {"WORK-HOLIDAY", "ALTERNATE-WORKDAY"}:
+                    continue
+                try:
+                    start = parse_ical_date(event["DTSTART"])
+                    # iCalendar's DTEND is exclusive for all-day events.
+                    end = parse_ical_date(event.get("DTEND", event["DTSTART"]))
+                except (KeyError, ValueError):
+                    continue
+                if end <= start:
+                    end = start + timedelta(days=1)
+                name = event.get("SUMMARY", "节假日").replace("（休）", "休").replace("（班）", "班")
+                kind = "rest" if special_day == "WORK-HOLIDAY" else "workday"
+                cursor = start
+                while cursor < end:
+                    holidays[cursor.isoformat()] = {"name": name, "kind": kind}
+                    cursor += timedelta(days=1)
+            _holiday_cache.update({"loaded_at": time.time(), "dates": holidays})
+        except requests.RequestException:
+            # The calendar is an enhancement, never a reason to block scheduling.
+            pass
+        return _holiday_cache["dates"]
 
 
 def db() -> sqlite3.Connection:
@@ -448,6 +516,13 @@ def bootstrap():
     if start > end:
         return jsonify({"error": "开始日期不能晚于结束日期"}), 400
 
+    holiday_dates = mainland_holidays()
+    holidays = {
+        item_date: detail
+        for item_date, detail in holiday_dates.items()
+        if start <= item_date <= end
+    }
+
     schedules = fetch_schedules()
     requested_id = request.args.get("scheduleId")
     active = None
@@ -482,6 +557,7 @@ def bootstrap():
             "rules": rules_payload(rules),
             "ai": {"configured": bool(DEEPSEEK_API_KEY), "model": DEEPSEEK_MODEL},
             "speech": {"configured": bool(DOUBAO_ASR_API_KEY)},
+            "holidays": holidays,
         }
     )
 
