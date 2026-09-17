@@ -248,6 +248,7 @@ button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-
 .holiday-label { min-width: 0; display: inline-flex; align-items: center; gap: 3px; overflow: hidden; color: #bd674e; font-size: 10px; font-weight: 700; line-height: 1; white-space: nowrap; }
 .holiday-label > span { overflow: hidden; text-overflow: ellipsis; }
 .holiday-label b { flex: 0 0 auto; padding-left: 3px; border-left: 1px solid currentColor; font-size: 9px; font-weight: 800; }
+.holiday-label > b:only-child { padding-left: 0; border-left: 0; }
 .holiday-label.is-workday { color: var(--text-faint); font-weight: 600; }
 .day-lanes { display: grid; gap: 0; }
 .shift-lane { position: relative; min-height: 36px; padding: 3px 1px; display: grid; grid-template-columns: 19px minmax(0, 1fr) 22px; gap: 4px; border: 0; border-radius: 0; background: transparent; transition: background .18s, box-shadow .18s; }

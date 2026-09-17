@@ -303,8 +303,8 @@ function DayCell({
           <span className="day-number">{format(day, "d")}</span>
           {format(day, "d") === "1" && <span className="day-month">{format(day, "M月")}</span>}
           {holiday && (
-            <span className={`holiday-label is-${holiday.kind}`} title={`${holiday.name} ${holiday.status}`}>
-              <span>{holiday.name}</span><b>{holiday.status}</b>
+            <span className={`holiday-label is-${holiday.kind}`} title={[holiday.name, holiday.status].filter(Boolean).join(" ")}>
+              {holiday.name && <span>{holiday.name}</span>}<b>{holiday.status}</b>
             </span>
           )}
         </div>

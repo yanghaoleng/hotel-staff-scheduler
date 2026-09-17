@@ -135,7 +135,13 @@ def mainland_holidays() -> dict[str, dict[str, str]]:
                 status = "休" if kind == "rest" else "补"
                 cursor = start
                 while cursor < end:
-                    holidays[cursor.isoformat()] = {"name": name, "kind": kind, "status": status}
+                    # A festival has one statutory date; the remaining days are leave days.
+                    display_name = name if kind == "rest" and cursor == start else ""
+                    holidays[cursor.isoformat()] = {
+                        "name": display_name,
+                        "kind": kind,
+                        "status": status,
+                    }
                     cursor += timedelta(days=1)
             _holiday_cache.update({"loaded_at": time.time(), "dates": holidays})
         except requests.RequestException:
