@@ -130,11 +130,12 @@ def mainland_holidays() -> dict[str, dict[str, str]]:
                     continue
                 if end <= start:
                     end = start + timedelta(days=1)
-                name = event.get("SUMMARY", "节假日").replace("（休）", "休").replace("（班）", "班")
+                name = event.get("SUMMARY", "节假日").replace("（休）", "").replace("（班）", "")
                 kind = "rest" if special_day == "WORK-HOLIDAY" else "workday"
+                status = "休" if kind == "rest" else "补"
                 cursor = start
                 while cursor < end:
-                    holidays[cursor.isoformat()] = {"name": name, "kind": kind}
+                    holidays[cursor.isoformat()] = {"name": name, "kind": kind, "status": status}
                     cursor += timedelta(days=1)
             _holiday_cache.update({"loaded_at": time.time(), "dates": holidays})
         except requests.RequestException:
