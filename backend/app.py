@@ -246,7 +246,7 @@ def init_database() -> None:
         stamp = now_iso()
         connection.execute(
             "INSERT INTO schedules(name, sort_order, created_at, updated_at) VALUES (?, 0, ?, ?)",
-            ("Jennie 8月排班", stamp, stamp),
+            ("示例排班（虚构）", stamp, stamp),
         )
     default_schedule_id = connection.execute(
         "SELECT id FROM schedules ORDER BY sort_order, id LIMIT 1"
@@ -300,13 +300,15 @@ def init_database() -> None:
             (default_schedule_id,),
         )
 
+    # Public demo data is entirely fictional and only seeds an empty staff table.
+    # Never rename, replace, or backfill records in an existing deployment.
     staff_count = connection.execute("SELECT COUNT(*) FROM staff").fetchone()[0]
     if staff_count == 0:
         seed_staff = [
-            ("张馨悦", "#ef6a5b", 0),
-            ("李贤英", "#4c7ee8", 1),
-            ("杨敏", "#2f9b77", 2),
-            ("刘东", "#d69232", 3),
+            ("示例员工甲", "#ef6a5b", 0),
+            ("示例员工乙", "#4c7ee8", 1),
+            ("示例员工丙", "#2f9b77", 2),
+            ("示例员工丁", "#d69232", 3),
         ]
         connection.executemany(
             "INSERT INTO staff(name, color, sort_order, created_at) VALUES (?, ?, ?, ?)",
@@ -316,23 +318,20 @@ def init_database() -> None:
             row["name"]: row["id"]
             for row in connection.execute("SELECT id, name FROM staff").fetchall()
         }
-        seed_shifts = {
-            "李贤英": {10: "B", 11: "A", 12: "A", 13: "OFF", 14: "OFF", 15: "B", 16: "B"},
-            "杨敏": {10: "OFF", 11: "B", 12: "B", 13: "A", 14: "A", 15: "OFF", 16: "OFF"},
-            "张馨悦": {10: "A", 11: "OFF", 12: "OFF", 13: "B", 14: "B", 15: "A", 16: "A"},
-            "刘东": {10: "A", 11: "OFF", 12: "A", 13: "A", 14: "A", 15: "OFF", 16: "OFF"},
-        }
+        # A synthetic seven-day rotation, unrelated to any real team's schedule.
+        demo_start = date(2026, 1, 5)
+        rotation = ("A", "B", "OFF", "OFF")
         rows = []
-        for person, days in seed_shifts.items():
-            for day, code in days.items():
+        for offset in range(7):
+            for position, (name, _color, _order) in enumerate(seed_staff):
                 rows.append(
                     (
                         default_schedule_id,
-                        staff_ids[person],
-                        f"2026-08-{day:02d}",
-                        code,
-                        "来自 Jennie 的排班截图",
-                        "import",
+                        staff_ids[name],
+                        (demo_start + timedelta(days=offset)).isoformat(),
+                        rotation[(position + offset) % len(rotation)],
+                        "完全虚构的演示数据，不对应真实人员或排班",
+                        "manual",
                         now_iso(),
                     )
                 )
@@ -345,52 +344,8 @@ def init_database() -> None:
             rows,
         )
 
-    explicit_offs_migrated = connection.execute(
-        "SELECT 1 FROM app_meta WHERE key = 'seed_explicit_offs_v1'"
-    ).fetchone()
-    if explicit_offs_migrated is None:
-        screenshot_codes = {
-            "张馨悦": {10: "A", 11: "OFF", 12: "OFF", 13: "B", 14: "B", 15: "A", 16: "A"},
-            "李贤英": {10: "B", 11: "A", 12: "A", 13: "OFF", 14: "OFF", 15: "B", 16: "B"},
-            "杨敏": {10: "OFF", 11: "B", 12: "B", 13: "A", 14: "A", 15: "OFF", 16: "OFF"},
-            "刘东": {10: "A", 11: "OFF", 12: "A", 13: "A", 14: "A", 15: "OFF", 16: "OFF"},
-        }
-        staff_ids = {
-            row["name"]: row["id"]
-            for row in connection.execute(
-                "SELECT id, name FROM staff WHERE name IN ('张馨悦', '李贤英', '杨敏', '刘东')"
-            ).fetchall()
-        }
-        rows = []
-        for person, days in screenshot_codes.items():
-            if person not in staff_ids:
-                continue
-            for day, code in days.items():
-                if code != "OFF":
-                    continue
-                rows.append(
-                    (
-                        default_schedule_id,
-                        staff_ids[person],
-                        f"2026-08-{day:02d}",
-                        code,
-                        "来自 Jennie 的排班截图",
-                        "import",
-                        now_iso(),
-                    )
-                )
-        connection.executemany(
-            """
-            INSERT OR IGNORE INTO shifts(
-                schedule_id, staff_id, shift_date, code, note, source, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            rows,
-        )
-        connection.execute(
-            "INSERT INTO app_meta(key, value) VALUES ('seed_explicit_offs_v1', ?)",
-            (now_iso(),),
-        )
+    # Historical seed-specific backfills are intentionally retired. Existing
+    # schedules and any old migration markers are preserved without modification.
     connection.commit()
     connection.close()
 
